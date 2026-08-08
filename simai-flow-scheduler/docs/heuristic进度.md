@@ -1073,3 +1073,186 @@ B: C(k)  -> L(2k)   -> C(3k)
 3. 把 Rollout-2 改成“承诺执行到当前 flow 完成”的 operation-level rollout，或至少同时评价连续执行 `x` ticks；当前 unit-step rollout 看不到上面反例中的连续投资收益。
 4. Beam 必须保留 Longest-tail incumbent/path，最终返回 `min(beam, incumbent)`。这不能自动给出 `<2`，但能严格获得“不差于 Longest-tail”，避免评分裁剪产生额外理论风险。
 5. 对 LLM 场景给出参数化保证比强求一般常数更现实，例如证明当 `frontier<=w`、每个 flow duration 量化后 `<=p` 时，宽度或 DP 状态达到某个 `f(w,p)` 即 exact。
+
+## 阶段 3：从并行链推广到一般 DAG（2026-08-17）
+
+### 1. 阶段目标与模型边界
+
+阶段 3 已实现一个独立研究原型 `scripts/study_general_dag_heuristics.py`，将阶段 2 的 tail、rollout 和 bounded search 推广到带 fork、join 和多层依赖的一般 DAG。执行模型与阶段 1 exact oracle 完全一致：
+
+- 所有 communication 共享一个单位容量、可抢占瓶颈；
+- ready compute 立即开始，彼此可并行；
+- duration 为整数时间量子；
+- compute resource order 已经编码为 DAG edge；
+- 调度器只能选择 ready communication，有 ready flow 时不允许主动 idle。
+
+这仍然是局部单瓶颈研究模型，不是 topology-aware executor。下面的实验不能证明多 NIC、多链路、fluid bandwidth sharing 下仍有相同近似比。
+
+### 2. Residual dynamic tail
+
+不再为完整 DAG 只计算一次静态 tail。每个决策状态先完成 compute closure，再按照当前剩余 duration 在 residual DAG 上反向计算：
+
+\[
+q_s(v)=\max_{(v,x)\in E,\ x\text{ unfinished}}
+\left(d_s(x)+q_s(x)\right).
+\]
+
+其中已经完成的节点被删除，正在执行的 compute/communication 使用 remaining duration，尚未开始的节点使用 profile duration。这样有三个直接效果：
+
+1. 正在并行执行的下游 compute 会不断缩短，旧的关键分支可以自动降级；
+2. join/fork 后的关键后继可以随 residual state 改变，不需要永久 chain decomposition；
+3. ready flow 的分数反映“从现在开始还剩多少关键工作”，而不是初始 DAG 上已经过时的距离。
+
+原型同时计算两个可证明安全的 residual lower bound：
+
+- `P_res`：所有未完成通信的剩余总量；
+- `L_res`：忽略通信竞争后的 residual critical path。
+
+rollout/beam 使用 `max(P_res,L_res)` 剪枝或打分，但不把它误当成精确 cost-to-go。
+
+### 3. Join gating 的实现与负面发现
+
+按照规划实现了最后阻塞者指标。对于 ready flow `v` 的直接 join 后继 `x`：
+
+\[
+g_s(v,x)=\max\left(0,EF_s(v)-
+\max_{u\in pred(x),u\ne v}EF_s(u)\right).
+\]
+
+若 `v` 比其它未完成输入更晚到达，则 `g>0`；若其它输入明显更晚，则 `g=0`。最初还尝试过根据“等待其它输入”的时间直接折减 tail，但专项搜索发现这种折减会变差，因此已经撤销：optimistic EF 没有计入通信竞争，不能安全地拿来改写 critical path。
+
+即使只把原规划中的 `g` 作为加分项，仍然不能安全地单独作为贪心策略。新增固定反例 `last_blocker_overboost`：
+
+| method | makespan |
+|---|---:|
+| Exact OPT | 20 |
+| Dynamic-tail | 20 |
+| Dynamic-tail + raw `g` | 21 |
+| Rollout-2 with incumbent | 20 |
+
+原因是 `g` 容易把“当前剩余时间较长”再次奖励一遍，产生类似 LRPT/LPT 的 double counting。阶段 3 因此得到一个重要设计修正：
+
+> join gating 适合用于扩充 top-k 候选、识别需要 lookahead 的冲突，不应未经 rollout 验证就直接线性加到最终优先级。
+
+### 4. Event-level top-k rollout
+
+实现了 `Rollout-2/4/8`。每次决策按 `dynamic tail + join signal` 筛选候选，对每个候选执行以下预测：
+
+1. 承诺执行候选 flow，直到该 flow 完成、某个 active compute 完成或有新 flow ready；
+2. 在新 residual state 上重新计算 dynamic tail、join signal 和 lower bound；
+3. 用 Dynamic-tail 基策略补全剩余 schedule，得到可行 upper bound；
+4. 先按完整 upper bound 选择，`delta + residual LB` 只用于 tie-break；
+5. 到预测的事件边界后重新规划。
+
+这修正了阶段 2 unit-tick rollout 的主要缺陷：如果一个通信必须连续推进多个 tick 才能释放长 compute，现在 rollout 能看到这项收益。
+
+研究脚本还单独保留一份完整 Dynamic-tail incumbent。如果增强 schedule 在确定性 profile 下反而更差，就返回 incumbent。因而当前离线原型逐实例不差于 Dynamic-tail。真实在线 executor 中 profile 可能有误差，接入时应保留已生成的 baseline plan，而不能假定预测 upper bound 就是真实完成时间。
+
+### 5. Local event beam
+
+实现了 receding-horizon `Beam-8`：
+
+- 展开单位是 communication/compute event，不是 tick；
+- 默认只看未来 3 个事件层；
+- 每层保留 8 个 residual state；
+- 排序首先使用 `elapsed + residual LB`，再使用 Dynamic-tail 补全 upper bound；
+- 完整 Dynamic-tail schedule 始终作为最终 incumbent。
+
+它解决的是局部冲突窗口，不搜索整个 iteration。固定宽度仍没有 exact 或小于 2 的一般保证；incumbent 只能保证当前确定性研究模型中的返回值不差于基线。
+
+### 6. Benchmark 扩展
+
+本阶段共评估 73 个 exact-oracle 可解实例：
+
+| category | 数量 | 说明 |
+|---|---:|---|
+| adversarial | 8 | 阶段 1 反例加 last-blocker overboost |
+| LLM motif | 7 | PP wave、1F1B、ZB B/W fork、W/DP optimizer join、TP+PP 等 |
+| real reduction | 8 | 从 992-node 真实 1F1B effective DAG 的 8 个高密度时间桶缩减 |
+| random general DAG | 50 | 2--5 个分支、可选第二段通信、nested join 和 optimizer join |
+
+真实窗口提取器也从“只取最密集时间桶”扩展为可指定 `bucket_rank`，因此可以扫描多个冲突位置。每个窗口仍保留直接前驱/后继、join 的 companion inputs、外部 release 和保守 downstream tail，并只纳入 exact state limit 内可解的窗口。
+
+### 7. 正式实验结果
+
+复现参数为 `samples=50, seed=260817`：
+
+| method | mean ratio | observed max | optimal fraction | mean Python runtime |
+|---|---:|---:|---:|---:|
+| Static Longest-tail | 1.00361 | 1.1250 | 95.89% | 1.21 ms |
+| 旧 Static gate-aware | 1.01440 | 1.1250 | 76.71% | 1.28 ms |
+| Residual Dynamic-tail | 1.00190 | 1.0909 | 97.26% | 2.24 ms |
+| Dynamic-tail + raw last-blocker `g` | 1.00258 | 1.0909 | 95.89% | 2.20 ms |
+| Event Rollout-2 | **1.00000** | **1.0000** | **100%** | 28.07 ms |
+| Event Rollout-4 | **1.00000** | **1.0000** | **100%** | 33.25 ms |
+| Event Rollout-8 | **1.00000** | **1.0000** | **100%** | 33.22 ms |
+| Local Beam-8 | **1.00000** | **1.0000** | **100%** | 290.70 ms |
+
+这些是 73 个实例上的 observed ratios，不是一般近似比证明。尤其不能由“全部命中最优”推出 Rollout-2 是 exact algorithm。
+
+Dynamic-tail 的两个非最优随机实例分别为：
+
+```text
+random_join_30: Dynamic-tail 24, OPT 22, Rollout-2 22
+random_join_40: Dynamic-tail 22, OPT 21, Rollout-2 21
+```
+
+因此 rollout 确实修复了可区分实例，而不是只在所有策略相同的图上得到 100%。另外，Rollout-2/4/8 在当前小图上结果完全相同，说明 frontier 很小时 `k=2` 已足够；没有证据支持在线默认使用更贵的 `k=8`。
+
+### 8. LLM motif 与真实窗口应如何解读
+
+7 个手工 LLM motif 和 8 个真实缩减窗口上，所有主要策略都得到 OPT。这首先说明 DAG 语义、residual 更新和 oracle 对接正确，但不能证明 heuristic 在真实完整训练中有收益。
+
+真实缩减窗口无法区分算法的主要原因是：
+
+- 当前窗口只保留 4 个 seed flows，选择空间仍偏小；
+- 边界 release 与保守 tail 可能主导 makespan；
+- 单瓶颈量化隐藏了不同 PP/TP/DP 路径之间的资源差异；
+- 窗口从 baseline earliest-start 时间桶选取，未必正好对应 heuristic 会改变的 conflict state。
+
+阶段 4 不能继续只增加相似 motif 数量。更有价值的是从执行 trace 中寻找“至少两种基线给出不同动作或不同 makespan”的 endogenous conflict window，再交给 exact oracle。
+
+### 9. 理论性质与尚未解决的问题
+
+四种新策略始终只选择 ready flow，且有 ready flow 时不主动 idle，因此在当前单瓶颈模型下保留规划中的 work-conserving 2-approx 安全底座。Dynamic-tail、join bonus 或有限 rollout 尚未带来严格小于 2 的一般证明。
+
+已得到的更实际性质是：
+
+1. residual tail 不需要静态 chain decomposition，能自然处理 fork/join；
+2. event rollout 修复了 unit-tick lookahead 看不到连续投资的问题；
+3. 完整 baseline incumbent 使增强搜索在确定性 profile 下不会降低结果；
+4. raw join-gating bonus 不是安全贪心，需要由 rollout 验证；
+5. 固定 Beam-8 的实测收益与 Rollout-2 相同，但开销约高一个数量级，目前没有在线使用优势。
+
+### 10. 推荐的阶段 3 产出策略
+
+当前最合理的一般 DAG 算法不是单独的 `Gate-aware priority`，而是：
+
+```text
+Residual Dynamic-tail baseline
+        + join/gate-aware candidate generation
+        + top-2 event-level rollout
+        + complete baseline incumbent
+```
+
+Beam-8 保留为离线/短窗口研究工具。下一阶段接入 LLM 特殊结构时，应优先加入：
+
+- backbone 与 deferred W/DP 的不同 deadline/tail；
+- optimizer join 的 latest-start slack，而非 raw last-blocker duration；
+- `(stage, phase, microbatch offset, chunk)` 模板状态压缩；
+- 多资源 `P_r` 和真实 route overlap；
+- 从 heuristic 分歧点提取窗口，而不是从 baseline 时间桶静态取窗。
+
+### 11. 产物与复现
+
+- 一般 DAG 研究脚本：`scripts/study_general_dag_heuristics.py`
+- 一般 DAG 回归：`tests/test_study_general_dag_heuristics.py`
+- 扩展后的真实窗口参数：`scripts/benchmark_dag_oracle.py::reduce_effective_dag(bucket_rank=...)`
+- 正式报告：`outputs/general_dag_heuristics/report.json`
+- 复现命令：
+
+```bash
+python scripts/study_general_dag_heuristics.py --samples 50 --seed 260817
+```
+
+阶段 0--3 定向回归为 `25 passed`，三个研究脚本的 `py_compile` 通过。全量回归为 `816 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的外部 `Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与本阶段修改无关。

@@ -711,6 +711,7 @@ def reduce_effective_dag(
     *,
     max_flows: int = 4,
     quantum_us: float = 500.0,
+    bucket_rank: int = 0,
 ) -> BenchmarkDAG:
     """Extract a small conflict window from a stage-0 effective DAG export.
 
@@ -732,7 +733,14 @@ def reduce_effective_dag(
     buckets: dict[int, list[dict]] = defaultdict(list)
     for node in flows:
         buckets[round(node["earliest_start_us"] / quantum_us)].append(node)
-    _bucket, candidates = max(buckets.items(), key=lambda item: (len(item[1]), -item[0]))
+    ranked_buckets = sorted(
+        buckets.items(), key=lambda item: (-len(item[1]), item[0]),
+    )
+    if not 0 <= bucket_rank < len(ranked_buckets):
+        raise ValueError(
+            f"bucket_rank={bucket_rank} outside 0..{len(ranked_buckets) - 1}"
+        )
+    _bucket, candidates = ranked_buckets[bucket_rank]
     seeds = sorted(candidates, key=lambda node: (node["slack_us"], node["id"]))[:max_flows]
     selected = {node["id"] for node in seeds}
     for seed in list(selected):
@@ -743,7 +751,12 @@ def reduce_effective_dag(
             selected.update(predecessors[node_id])
 
     builder = _Builder(
-        "reduced_real_1f1b_window", "real_reduction",
+        (
+            "reduced_real_1f1b_window"
+            if bucket_rank == 0
+            else f"reduced_real_1f1b_window_{bucket_rank}"
+        ),
+        "real_reduction",
         "Conflict window reduced from a stage-0 effective DAG export.",
     )
 
@@ -783,7 +796,7 @@ def reduce_effective_dag(
             )
     reduced = builder.finish(
         source_nodes=len(nodes), selected_nodes=len(selected),
-        seed_flows=len(seeds), quantum_us=quantum_us,
+        seed_flows=len(seeds), quantum_us=quantum_us, bucket_rank=bucket_rank,
     )
     return contract_compute_chains(reduced)
 
