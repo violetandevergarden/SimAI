@@ -226,6 +226,27 @@ class ResidualDAG:
                 return successor, elapsed
             state = successor
 
+    def advance_action(
+        self,
+        state: State,
+        selected: int,
+        horizon: str,
+    ) -> tuple[State, int]:
+        """Advance one counterfactual action under a declared commitment."""
+
+        if horizon == "tick":
+            return self.tick(state, selected), 1
+        if horizon == "event":
+            return self.advance_to_event(state, selected)
+        if horizon == "flow_complete":
+            state = self.close(state)
+            elapsed = 0
+            while state[selected] != 0:
+                state = self.tick(state, selected)
+                elapsed += 1
+            return state, elapsed
+        raise ValueError(f"unknown rollout horizon: {horizon}")
+
 
 def _simulate_from_state(
     model: ResidualDAG,
@@ -284,6 +305,8 @@ def rollout_schedule(
     *,
     top_k: int = 4,
     base_policy: str = "dynamic_tail",
+    candidate_policy: str = "hybrid",
+    horizon: str = "event",
 ) -> DAGScheduleResult:
     """Top-k event rollout; the candidate set always contains the base action.
 
@@ -295,6 +318,10 @@ def rollout_schedule(
 
     if top_k < 1:
         raise ValueError("top_k must be positive")
+    if candidate_policy not in {"dynamic_tail", "join", "hybrid"}:
+        raise ValueError(f"unknown candidate policy: {candidate_policy}")
+    if horizon not in {"tick", "event", "flow_complete"}:
+        raise ValueError(f"unknown rollout horizon: {horizon}")
     model = ResidualDAG(dag)
     if base_policy == "gate_dynamic_tail":
         base = model.select_gate_tail
@@ -322,22 +349,38 @@ def rollout_schedule(
             continue
 
         analysis = model.analyze(state)
-        ranked = sorted(
+        dynamic_ranked = sorted(
             ready,
             key=lambda index: (
-                analysis.gate_tail[index], analysis.gate_gain[index],
-                analysis.tail[index], -model.remaining(state, index), -index,
+                analysis.tail[index], analysis.gate_gain[index],
+                -model.remaining(state, index), -index,
             ),
             reverse=True,
         )
-        base_action = base(state, ready)
-        candidates = ranked[:top_k]
-        if base_action not in candidates:
-            candidates[-1] = base_action
+        join_ranked = sorted(
+            ready,
+            key=lambda index: (
+                analysis.gate_gain[index], analysis.tail[index],
+                -model.remaining(state, index), -index,
+            ),
+            reverse=True,
+        )
+        if candidate_policy == "dynamic_tail":
+            candidates = dynamic_ranked[:top_k]
+        elif candidate_policy == "join":
+            candidates = join_ranked[:top_k]
+        else:
+            dynamic_quota = (top_k + 1) // 2
+            candidates = dynamic_ranked[:dynamic_quota]
+            candidates.extend(
+                index for index in join_ranked
+                if index not in candidates
+            )
+            candidates = candidates[:top_k]
 
         evaluated = []
         for candidate in candidates:
-            successor, delta = model.advance_to_event(state, candidate)
+            successor, delta = model.advance_action(state, candidate, horizon)
             continuation = _simulate_from_state(
                 model, successor, base, collect_decisions=False,
             ).makespan
@@ -354,7 +397,7 @@ def rollout_schedule(
             and state[previous] > 0 and model.tasks[previous].kind == "comm"
         ):
             preemptions += 1
-        state, delta = model.advance_to_event(state, selected)
+        state, delta = model.advance_action(state, selected, horizon)
         decisions.extend(model.order[selected] for _ in range(delta))
         previous = selected
 

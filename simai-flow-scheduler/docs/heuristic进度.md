@@ -1256,3 +1256,935 @@ python scripts/study_general_dag_heuristics.py --samples 50 --seed 260817
 ```
 
 阶段 0--3 定向回归为 `25 passed`，三个研究脚本的 `py_compile` 通过。全量回归为 `816 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的外部 `Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与本阶段修改无关。
+
+## 阶段 3.5：困难实例与端到端 Counterfactual Bonus（2026-08-09）
+
+### 1. 为什么需要重做实验
+
+阶段 3 的 73 个实例中，Dynamic-tail 已有 97.26% 最优率，7 个 LLM motif 和 8 个真实缩减窗口又全部无法区分算法。这只能证明实现基本正确，不能可靠判断 join 信息或 rollout horizon 的独立贡献。
+
+阶段 3.5 因此不再从普通随机分布计算“总体最优率”，而是只保留满足以下条件的实例：
+
+```text
+exact oracle 可解
+且 Dynamic-tail makespan > OPT
+```
+
+这相当于直接以
+
+\[
+regret_{DT}=T_{DT}-OPT>0
+\]
+
+作为 benchmark 准入条件。正式搜索尝试 513 个一般 fork/join DAG，得到 20 个困难实例，接受率 3.90%。这也反过来证实：原来的普通随机 benchmark 中约 96% 的实例确实没有能力区分增强算法。
+
+20 个困难实例上 Dynamic-tail 的 mean ratio 为 1.05276，observed max 为 1.07692。所有实例都有真实正 regret，因此“修复率”和“gap closed”比普通总体最优率更有意义。
+
+### 2. 端到端 bonus 的正式定义
+
+对当前状态 `s` 和候选动作 `v`，令执行到指定 horizon 后的状态为 `s_v`、耗时为 `delta_v`，再用 Dynamic-tail 补全剩余 schedule：
+
+\[
+\widehat C(v\mid s)=\Delta_v+\widehat J_{DT}(s_v).
+\]
+
+相对于 Dynamic-tail 基础动作 `a_0`，端到端 counterfactual bonus 定义为：
+
+\[
+B(v\mid s)=\widehat C(a_0\mid s)-\widehat C(v\mid s).
+\]
+
+最终直接选择 `C_hat` 最小、等价地 `B` 最大的候选，不再把 bonus 与 tail 相加。这样 join 解锁、后续 compute、机会成本和通信推迟都通过完整补全 schedule 统一进入端到端评价，避免 raw join bonus 的重复奖励。
+
+完整 Dynamic-tail schedule 继续作为 incumbent；若 counterfactual schedule 更差则返回 incumbent。因此在当前确定性 profile 研究模型中，所有消融结果都不会比 Dynamic-tail 更差。
+
+### 3. 两个正交消融维度
+
+候选来源与动作执行范围被严格拆开。
+
+候选来源：
+
+- `DT`：只取 Dynamic-tail top-k；
+- `Join`：只取 last-blocker urgency top-k；
+- `Hybrid`：`k=2` 时保留 1 个 Dynamic-tail 候选和 1 个不同的 Join 候选。
+
+动作 horizon：
+
+- `tick`：只推进一个时间量子；
+- `event`：推进到当前 flow 完成、active compute 完成或新 flow ready；
+- `flow`：强制推进到当前 flow 完成。
+
+正式实验使用 `top_k=2`，形成 7 组主要消融。
+
+### 4. 困难集正式结果
+
+| 方法 | mean ratio | observed max | 修复为 exact | mean gap closed | mean runtime |
+|---|---:|---:|---:|---:|---:|
+| DT + tick | 1.01471 | 1.05882 | 14/20 | 70% | 32.79 ms |
+| **DT + event** | **1.00227** | **1.04545** | **19/20** | **95%** | 21.24 ms |
+| DT + flow-complete | 1.02165 | 1.07692 | 12/20 | 60% | 12.79 ms |
+| Join + event | 1.00227 | 1.04545 | 19/20 | 95% | 21.44 ms |
+| Hybrid + tick | 1.01471 | 1.05882 | 14/20 | 70% | 32.15 ms |
+| **Hybrid + event** | **1.00227** | **1.04545** | **19/20** | **95%** | 20.96 ms |
+| Hybrid + flow-complete | 1.02165 | 1.07692 | 12/20 | 60% | 12.52 ms |
+
+这是本轮最明确的正面结论：
+
+> 用户提出的“bonus 应衡量端到端改善”是正确方向；在全部由 Dynamic-tail 失败实例组成的困难集上，next-event counterfactual rollout 修复了 19/20，并平均关闭 95% 的 optimality gap。
+
+同时 horizon 不能随意选择：
+
+- `tick` 只关闭 70% gap，仍然看不到需要连续投资一小段时间才能释放的收益；
+- `flow-complete` 只关闭 60% gap，对长 flow 过度承诺，错过中途新 compute/flow 事件；
+- `next-event` 在信息量和可撤销性之间取得最好平衡。
+
+`flow-complete` runtime 更低不是优势，而是因为决策次数更少；它以明显更差的 schedule quality 换取了这一开销。
+
+### 5. Join 候选有没有独立价值
+
+当前答案仍是：**没有观察到独立正收益。**
+
+20 个困难实例中：
+
+- 15 个实例沿 Dynamic-tail 路径出现过 `ready frontier > 2`；
+- 共出现 59 个 `frontier > 2` 的决策 tick；
+- Join top-2 真正替换 Dynamic-tail top-2 候选集的状态只有 3 个；
+- `DT+event`、`Join+event`、`Hybrid+event` 的最终结果逐实例完全相同。
+
+为避免“困难集仍不是 join-sensitive”的质疑，又做了专项筛选：先要求 Join top-2 与 Dynamic-tail top-2 确实不同，再要求 Dynamic-tail 非最优。在前 1,546 个尝试中只找到 4 个满足条件的实例；这 4 个实例上三种 event rollout 仍全部得到相同结果。
+
+因此现在可以更精确地区分两个结论：
+
+1. **端到端 counterfactual 评价有效；**
+2. **当前 `EF last-blocker` join 特征没有显示候选增益。**
+
+这不证明所有 join 信息都无用，只说明当前特征过于局部且激活率太低。下一步若继续研究 join，应改用 optimizer/latest-start slack、join 后 residual critical tail 或真实 resource-delay sensitivity，而不是继续调整 raw `EF(v)-EF(other)` 权重。
+
+### 6. Decision-centric 真实窗口
+
+新增脚本先把完整 992-task 真实 1F1B effective DAG 量化，然后沿 Dynamic-tail schedule 在**同一个 residual state**比较：
+
+- 初始静态 tail；
+- residual Dynamic-tail；
+- raw gate-tail；
+- SPT；
+- LPT。
+
+不再按通信密度取窗，而是在动作不同的位置提取 ready flows、两层下游节点、外部 release 与有限 boundary tail。为了让 exact oracle 可解，正式设置为：
+
+- `quantum_us=10000`；
+- 最多 24 个窗口任务；
+- 下游深度 2；
+- boundary release/tail 上限 30 个量子；
+- exact state limit 50,000。
+
+完整量化 DAG 共执行 560 tick，其中发现 422 个策略分歧 tick。大量分歧窗口仍因任务数或 exact state limit 被跳过，最终目标 8 个、得到 5 个 exact 可解窗口。
+
+但这 5 个窗口上 Static-tail、Dynamic-tail、Hybrid-event 和 OPT 仍然全部相同，`distinguishing_windows=0`。这个负面结果说明：
+
+> “策略当前动作不同”仍不等于“这个动作会改变局部或端到端 makespan”。
+
+目前窗口压缩还有两项根本限制：10 ms 粗量化会合并小 flow/compute 差异；截断的 boundary tail 只能保持局部结构，不能完整表达 iteration 末端影响。因此真实窗口闭环已经从“没有分歧状态”推进到“有 422 个动作分歧”，但尚未得到真实性能可区分窗口。
+
+### 7. 当前推荐算法
+
+阶段 3.5 后，推荐从原来的泛称 `Gate-Aware Dynamic Tail Rollout` 收敛为：
+
+```text
+Residual Dynamic-tail baseline
+        + Dynamic-tail top-2 candidates
+        + next-event counterfactual completion estimate
+        + complete Dynamic-tail incumbent
+```
+
+当前没有证据要求在线候选中强制保留 raw join bonus。Join、optimizer slack、backbone/deferred role 可以继续作为实验特征，但必须用同样的 end-to-end counterfactual 评价证明其独立贡献。
+
+### 8. 下一步研究重点
+
+1. 对唯一未被 event rollout 修复的困难实例做最小化，识别需要 two-event 还是更强 lower bound；
+2. 将 join urgency 改成 `latest-start slack` 与“join 后关键尾长”，再做同样的 join-sensitive 筛选；
+3. 真实窗口改为保留原始微秒 duration，并使用 branch-and-bound/CP-SAT 或 gap certificate，而不是依赖粗量化 DP；
+4. 从完整 executor 的多资源状态保存 route/link contention，使 PP/TP/DP 分歧不再被单瓶颈模型抹平；
+5. 阶段 4 的 backbone/deferred W/DP 策略也必须在 hard subset 上报告 gap closed，而不是回到普通总体最优率。
+
+### 9. 产物与复现
+
+- Counterfactual/hard benchmark 脚本：`scripts/study_counterfactual_bonus.py`
+- 候选来源与 horizon 扩展：`scripts/study_general_dag_heuristics.py::rollout_schedule`
+- 回归测试：`tests/test_study_counterfactual_bonus.py`
+- 正式报告：`outputs/counterfactual_bonus/report.json`
+- 复现命令：
+
+```bash
+python scripts/study_counterfactual_bonus.py \
+  --hard-samples 20 --real-windows 8 --top-k 2 --seed 260818
+```
+
+阶段 0--3.5 定向回归为 `29 passed`。全量回归为 `820 passed, 3 skipped, 18 errors`；18 个 error 仍全部是缺失外部 Spectrum-X topology fixture 的已知环境问题，没有新增功能失败。
+
+## 阶段 4a：从单 channel 扩展到路径资源冲突（2026-08-10）
+
+### 1. 本阶段先回答什么问题
+
+阶段 0--3.5 把所有通信压在同一个 channel 上，因此任意时刻只能推进一条 flow。这个模型适合研究“先传哪一条”，但会把现实中两种完全不同的情况混为一谈：
+
+- 两条 flow 经过同一条 NIC/uplink，确实必须竞争；
+- 两条 flow 的 route 完全不重叠，本来可以同时传输。
+
+如果先在这个单 channel 模型上加入 backbone、W/DP deadline 等 LLM 特征，可能会把“虚构出来的冲突”解释成 DAG 策略收益。因此本阶段没有直接修改完整 executor，而是先建立一个小规模可精确求解的 topology-conflict oracle，检查单 channel 结论能否外推。
+
+### 2. 多资源模型
+
+每条通信 (v) 除 duration 和 DAG deps 外，再带一个资源集合 (R_v)。资源可以是实际 route 上的有向链路，也可以是 NIC injection、PP fabric、DP fabric 等逻辑瓶颈。每个整数时间量子内选择一个 ready flow 集合 (A)，要求
+
+\[
+R_u\cap R_v=\varnothing,\qquad \forall u\ne v\in A.
+\]
+
+也就是说，共享任意资源的 flow 不能同时推进，资源集合互不相交的 flow 可以并行推进。模型继续保留：
+
+- flow 可在量子边界抢占；
+- ready compute 立即开始且彼此并行；
+- compute resource order 已经编码为 DAG edge；
+- 调度动作从“一条 ready flow”变成“一个兼容的 ready flow 集合”。
+
+这仍不是完整带宽模拟。当前每个资源容量归一化为 1，flow 必须同时占有 route 上全部资源，不表达 max-min sharing、不同链路带宽、packet pipeline、ECMP 多路径和细粒度 NIC duplex 约束。它的定位是 topology conflict 的小窗口 oracle，而不是替换 `AnalyticalExecutor`。
+
+### 3. 与现有拓扑代码的连接
+
+新增 `route_resource_sets(workload, route_table)`，直接读取现有 `RouteTable.get_path(task)`，把相邻节点对变成资源：
+
+```text
+path [0, 8, 12, 3]
+    -> {(0,8), (8,12), (12,3)}
+```
+
+默认使用有向链路，与当前 topology/executor 的 full-duplex link 表示一致；敏感性实验可用 `directed=False` 合并正反方向。`task_id_prefix` 可把真实 task id 映射到 effective benchmark 使用的 `t{id}`。这一步没有改通用 `Task` schema、builder、serializer 或 executor。
+
+### 4. 精确 Oracle 与下界
+
+精确 DP 的状态仍是所有 task 的 residual duration。每一步枚举 ready flow 的 inclusion-maximal compatible sets，并推进一个时间量子。这里只枚举 maximal set 是安全的：在当前独占、无 setup cost 的模型里，给一个动作加入不冲突的 ready flow 不会延迟原动作、compute 或任何其他资源，只可能让新 flow 更早完成。
+
+多资源下界改为
+
+\[
+LB=\max\left\{L,\max_r P_r\right\},
+\]
+
+其中 (L) 是忽略资源竞争的 residual critical path，(P_r) 是所有仍会使用资源 (r) 的 flow residual work 之和。单 channel 的总通信量 (P) 不再是合法的多资源下界，因为不重叠流量可以并行；它只在把所有 (R_v) 都压成同一个资源时恢复。
+
+### 5. 对照算法
+
+本阶段实现了四类动作选择：
+
+1. `Dynamic-tail pack`：按 residual tail 排序，再贪心装入互不冲突的 flow。这是把阶段 3.5 基线自然提升到多资源后的版本；
+2. `Resource-tail pack`：tail 优先，在相近选择中加入 residual bottleneck load；
+3. `Bottleneck-first`：优先处理所经资源剩余负载最大的 flow；
+4. `Set rollout-k`：候选不再是单条 flow，而是 maximal compatible set；对每个集合执行到 next event，再用完整 Dynamic-tail pack 补全端到端 makespan。完整基线继续作为 incumbent。
+
+### 6. Benchmark 设计
+
+正式实验包含 53 个 exact-oracle 可解实例：3 个手工 topology motif 加 50 个随机 fork/join DAG。每条随机通信经过 endpoint NIC、按 PP/DP/TP role 区分的 fabric，并以 35% 概率再经过 shared uplink，从而同时包含 disjoint、完全重叠和部分重叠 route。
+
+三个手工 motif 验证了模型语义：
+
+| motif | multi-resource OPT | 压成 single-channel OPT | 含义 |
+|---|---:|---:|---|
+| `disjoint_routes` | 7 | 11 | 两条 4-tick flow 同时传，之后各有 3-tick compute tail |
+| `shared_uplink` | 11 | 11 | endpoint 不同但共享 uplink，不能并行 |
+| `pp_dp_partial_overlap` | 9 | 13 | PP/DP 共享 NIC，TP 使用独立本地资源 |
+
+### 7. 正式实验结果
+
+复现参数为 `samples=50, seed=260819, max_states=500000`：
+
+| method | mean ratio | observed max | optimal fraction | mean Python runtime |
+|---|---:|---:|---:|---:|
+| Dynamic-tail pack | 1.01749 | 1.15789 | 75.47% | 2.56 ms |
+| Resource-tail pack | 1.01677 | 1.15789 | 75.47% | 2.55 ms |
+| Bottleneck-first | 1.02947 | 1.21053 | 71.70% | 2.56 ms |
+| **Set rollout-2** | **1.00463** | **1.08696** | **92.45%** | 22.54 ms |
+| Set rollout-4 | 1.00463 | 1.08696 | 92.45% | 24.64 ms |
+
+这些仍是有限小实例上的 observed ratios，不是多资源模型的一般近似比。
+
+把同一批 DAG 的所有 flow 压成一个 channel 后，即使两边都取 exact OPT，single-channel makespan 平均仍比多资源 OPT 高 **14.88%**，最大高 **57.14%**。因此拓扑扩展不是只改变算法实现：单 channel 确实会制造大量不存在的串行化，并可能改变 heuristic 的相对评价。
+
+### 8. 困难子集与特征贡献
+
+53 个实例中有 13 个满足 `Dynamic-tail pack > multi-resource OPT`。只在这个困难子集上统计：
+
+| method | 修复到 exact | mean gap closed |
+|---|---:|---:|
+| Resource-tail pack | 1/13 | 10.26% |
+| Bottleneck-first | 3/13 | -15.38% |
+| **Set rollout-2** | **9/13** | **69.23%** |
+| Set rollout-4 | 9/13 | 69.23% |
+
+主要发现是：
+
+1. **资源负载不能直接取代 DAG tail。** 纯 Bottleneck-first 虽偶尔修复实例，但平均 gap closed 为负，说明提前清理热点资源可能推迟真正的 critical unlock；
+2. **简单 Resource-tail 的独立价值很小。** 它与 Dynamic-tail 只在 3/53 个实例上产生不同 makespan，其中 2 个更好、1 个更差；只靠一个静态负载 tie-break 不足以理解集合选择的后果；
+3. **阶段 3.5 的端到端 counterfactual 思路可以自然推广。** 把候选动作改成兼容集合后，Rollout-2 修复 9/13 个困难实例并关闭 69.23% gap；
+4. **当前 frontier 下 `k=4` 没有额外收益。** Rollout-2 与 Rollout-4 在全部 53 个实例上 makespan 完全相同，不支持在线默认扩大到 4；
+5. **调度对象应是兼容集合，不再是一条 flow。** 真实 topology 下只给 flow 排一个全序会丢失最重要的并行性；全序至多适合作为 greedy packing 的候选顺序。
+
+### 9. 对近似保证的影响
+
+单 channel 的 work-conserving 2-approx 证明不能直接搬到这里。原证明把所有 network-busy 时间 charge 到总通信量 (P)，但在多资源模型中：
+
+- 多条 flow 可同时推进，makespan 不能再由总 work (P) 正确刻画；
+- 一个 maximal compatible set 仍可能选错“组合”，长时间占住多个关键资源；
+- 不同资源的 busy interval 会重叠，简单相加 (P_r) 会重复计时。
+
+当前可安全使用的是下界 `max(L, max_r P_r)` 和 exact small-window oracle；尚未得到 Dynamic-tail pack 或 Set rollout 的常数近似比。若要继续做理论保证，应研究 route-resource hypergraph 的结构参数，例如每条 flow 最多占用的资源数、冲突图的 interval/chordal 性质、树拓扑路径的特殊性质，而不能继续沿用单机抢占调度的证明。
+
+### 10. 下一步
+
+1. 用真实 workload 的 effective DAG task id 加 BFS/Greedy route，提取 PP/TP/DP/EP 的 route-resource sets 和冲突图统计；
+2. 不直接把完整 992-task 图交给指数 Oracle，而是在真实执行状态中提取 `ready frontier + downstream boundary` 的 decision-centric 多资源窗口；
+3. 先保留有向链路独占模型做 oracle，再逐步加入 NIC injection resource 和每资源容量；
+4. 用完整 executor 的 max-min bandwidth allocation 复核小模型中产生分歧的动作，测量独占冲突模型与真实共享带宽的误差；
+5. 在资源语义可信之后，再加入 backbone/deferred W/DP、optimizer latest-start slack 和周期模板，并继续报告 hard-subset gap closed。
+
+### 11. 产物与复现
+
+- 多资源模型、Oracle、heuristic 与 route adapter：`scripts/study_multiresource_dag.py`
+- 回归测试：`tests/test_study_multiresource_dag.py`
+- 正式报告：`outputs/multiresource_dag/report.json`
+- 复现命令：
+
+```bash
+python scripts/study_multiresource_dag.py \
+  --samples 50 --seed 260819 --max-states 500000
+```
+
+阶段 4a 新增定向回归 `7 passed`；阶段 1--4a 联合定向回归 `22 passed`。只读 syntax 检查和 `git diff --check` 通过；当前环境未安装 `ruff`。全量回归为 `827 passed, 3 skipped, 18 errors`，18 个 error 仍全部来自缺失的外部 `Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与本阶段修改无关。
+
+## 阶段 4b：真实 effective DAG 与 AlibabaHPN route 窗口（2026-08-12）
+
+### 1. 本阶段连接了哪些真实组件
+
+阶段 4a 的 53 个实例使用人工/随机资源集合，只证明了多资源模型有必要，不能证明真实 LLM DAG 中存在同样的调度空间。本阶段把以下仓库内真实组件闭环连接：
+
+```text
+WorkloadBuilder / advanced pipeline builder
+    -> pipeline compute serializer
+    -> data deps + compute_order resource edges
+    -> effective DAG
+    -> AlibabaHPN_16g topology
+    -> BFS RouteTable
+    -> 每条 flow 的 directed-link resource set
+    -> decision-centric multi-resource exact window
+```
+
+使用的 probe 为 `pp=2,tp=2,dp=2,ga=4,layers=4`，包含 PP、TP 和 DP 流量；通信大小与计算时长来自 `build_hybrid_input` 的固定 homogeneous profile。因而这里的“真实”准确含义是：真实 builder、真实 effective dependency、真实 topology 文件和真实 BFS route；它仍不是 GPT-7B/13B 实测 AICB profile，不能把绝对 makespan 当成模型训练性能。
+
+新增脚本在构造 benchmark 时保留原始 task id 映射：effective DAG 的 `t{id}` 与 workload flow id 一一对应，因此 route 不是按 role 猜测或随机分配的。
+
+### 2. NIC resource 敏感性
+
+仅比较 route edge 仍可能漏掉一种冲突：同一 GPU 的 PP 和 TP flow 可能分别走不同物理边，但共享 NIC injection。`route_resource_sets` 因此新增两个可选资源：
+
+```text
+("nic_tx", src)
+("nic_rx", dst)
+```
+
+正式报告默认使用 `directed links + NIC-TX + NIC-RX`，共 32 个资源；另跑一遍 `--link-only`，只保留 16 个有向链路资源。两种模型在本轮五种 pipeline 的以下所有统计上完全相同：
+
+- full schedule 的 conflict fraction；
+- policy disagreement tick；
+- 提取出的 5 个窗口；
+- 每种 heuristic 的 makespan 与 exact ratio。
+
+这不是说 NIC 永远无关，而是说明当前 probe 的 ready 波次没有同时出现“端点相同但 route edge 不同”的 flow。NIC 资源已经保留为后续真实 trace、多 job 和不同 placement 的敏感性选项。
+
+### 3. 多资源 decision-centric 窗口
+
+对每种 pipeline，沿 `Dynamic-tail pack` 的完整执行轨迹，在同一个 residual state 上比较：
+
+- Dynamic-tail pack；
+- Resource-tail pack；
+- Bottleneck-first；
+- SPT/LPT pack；
+- PP-first/DP-first pack。
+
+当至少一个策略选出的 maximal compatible set 不同时，以这些 flow 和共享资源的 ready competitors 为 seed。由于 depth-1/2 窗口会迅速扩张到 42 个以上节点，本阶段正式使用 `depth=0 + boundary tail/release`：保留当前决策 flow 的原始 residual duration 与 route resources，并用保守 boundary compute 表达其下游 tail。它适合判断“当前集合选择是否会影响有限 horizon”，但不能代替完整 iteration 的因果影响；窗口结果必须和 full trace 的分歧密度一起解释。
+
+### 4. 五种 pipeline 的完整轨迹统计
+
+时间量子为 25 us。完整图和 Dynamic-tail packed schedule 的结果如下：
+
+| pipeline | tasks | simulated ticks | mean ready width | mean action width | ready-pair conflict | disagreement ticks | exact windows |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1F1B | 992 | 2764 | 4.107 | 4.053 | 0.810% | 2 | 1 |
+| Interleaved 1F1B | 1056 | 2502 | 4.135 | 4.135 | 0% | 0 | 0 |
+| Zero Bubble | 992 | 2666 | 4.000 | 4.000 | 0% | 0 | 0 |
+| Bidirectional/Chimera | 1088 | 2678 | 6.552 | 6.069 | 3.407% | 16 | 4 |
+| DualPipe | 1072 | 2225 | 8.000 | 8.000 | 0% | 0 | 0 |
+
+最重要的结构发现不是某个新 heuristic 获得明显收益，而是：
+
+> 当前单 job、固定 placement 的真实 route ready frontier 大部分时间接近一个天然兼容集合；除 Bidirectional 外，route conflict 极少。单 channel 模型把 mean action width 4--8 的并发通信强制串行，严重改变了问题本身。
+
+Zero Bubble 和 DualPipe 的 frontier 并不小，但所有 ready flow 都能同时装入兼容集合，所以不存在“先传哪条”的离散选择。这个结果也再次提醒：serializer 的执行顺序或 pipeline 名称不能自动制造 network scheduling opportunity，必须检查 effective deps 与 route overlap。
+
+### 5. Exact 窗口结果
+
+共得到 5 个 exact 多资源窗口：1 个来自 1F1B，4 个来自 Bidirectional。1F1B 窗口包含 4 条 TP 和 2 条 PP flow；4 个 Bidirectional 窗口均为 6 条 DP flow。
+
+| method | mean ratio | observed max | optimal fraction |
+|---|---:|---:|---:|
+| Dynamic-tail pack | 1.00000 | 1.00000 | 100% |
+| Resource-tail pack | 1.00000 | 1.00000 | 100% |
+| Bottleneck-first | 1.00000 | 1.00000 | 100% |
+| SPT pack | 1.00000 | 1.00000 | 100% |
+| LPT pack | 1.06667 | 1.16667 | 60% |
+| PP-first / DP-first | 1.00000 | 1.00000 | 100% |
+| Set rollout-2 | 1.00000 | 1.00000 | 100% |
+
+5 个窗口中只有 2 个能区分算法，区别仅来自 LPT：在两个 `OPT=6` 的 Bidirectional DP 窗口中，LPT 得到 7。Dynamic-tail 与所有拓扑增强方法都命中 OPT，因此本轮没有证据说明 Resource-tail、Bottleneck-first 或 Rollout 在真实 probe 上比 Dynamic-tail 更好。
+
+这与阶段 4a 并不矛盾：阶段 4a 的困难随机资源图证明 Set rollout 在“确有组合冲突”时有价值；阶段 4b 说明当前真实 probe 很少产生这种组合冲突。算法评价必须同时报告“机会是否出现”和“出现后是否修复”，不能只报告总体最优率。
+
+### 6. Single-channel 对照
+
+5 个窗口中，4 个 single-channel exact 对照在 100,000 状态内完成；另一个 1F1B 窗口因串行排列状态爆炸记录为 `state_limit`，没有把超限当作数值结果。4 个可解窗口中：
+
+- 多资源 OPT 分别为 6、4、6、4；
+- single-channel OPT 分别为 10、8、10、8；
+- single-channel 平均高估 **83.33%**。
+
+这个窗口级结果比阶段 4a 的 14.88% 平均高估更强，原因是窗口专门位于并行 ready wave。它进一步证明：后续不能在单 channel 上设计出 priority，再直接把相对收益解释成真实拓扑收益。
+
+### 7. Placement 探索
+
+额外对 1F1B 检查了四种 8-GPU rank 排列：contiguous、跨服务器交错、TP group 分裂式排列和另一组 cross permutation。四者在本轮 probe 上都得到相同的 `0.810%` ready-pair conflict 和 2 个 disagreement ticks。AlibabaHPN 的对称路径与 Ring collective 的分步端点配对使这些简单 permutation 没有形成新的 ready-route overlap。
+
+这只是诊断，不应外推成“placement 不重要”。要产生可信的 placement 对照，需要使用论文/生产 placement、完整 16/32 GPU 并行配置和真实 AICB phase timing，而不是继续手工试 permutation。
+
+### 8. 对下一步的修正
+
+本阶段结果意味着不应立刻在当前 homogeneous single-job probe 上继续调资源 bonus，因为可利用冲突太少。下一步优先级应改为：
+
+1. **接入真实 GPT AICB profile。** 使用已经验证的 GPT-7B/13B 配置，保留原始微秒 duration，检查 phase timing 是否让 PP/TP/DP 真正同时 ready；
+2. **提取 executor endogenous contention window。** 不只沿离散 exclusive model 的 schedule，而从 `AnalyticalExecutor` trace 中找实际 active flows 共享 link/NIC 且不同 policy 会改变完成顺序的时段；
+3. **从独占集合扩展到容量分配动作。** 当 flow 可以 max-min 共享链路时，动作不只是 compatible set，而是 ready/active flow 的 bandwidth allocation；小窗口 Oracle 可离散化 allocation level 或使用 time-expanded LP/CP-SAT；
+4. **研究多 job contention。** 单 job collective wave 天然规整，多 job 相位错开更可能在 core/uplink 产生非模板化冲突；但必须保证不同 job 使用合法、不重叠的 GPU placement；
+5. **修复/确认 ZB 的 B-W DAG 解耦后再评价 deferred-W。** 当前 ZB 路径没有 route conflict，既可能来自天然并行，也可能与 W 依赖建模限制调度自由度有关，不能据此否定 ZB-specific heuristic；
+6. 只有当真实 hard windows 出现后，再比较 Dynamic-tail、resource-delay sensitivity、backbone/deferred deadline 和 Set rollout 的 gap closed。
+
+### 9. 产物与复现
+
+- 真实 route effective-window 脚本：`scripts/study_llm_route_windows.py`
+- route/NIC resource adapter：`scripts/study_multiresource_dag.py::route_resource_sets`
+- 回归测试：`tests/test_study_llm_route_windows.py`、`tests/test_study_multiresource_dag.py`
+- 正式报告：`outputs/llm_route_windows/report.json`
+- link-only 敏感性报告：`outputs/llm_route_windows/report_link_only.json`
+- 复现命令：
+
+```bash
+python scripts/study_llm_route_windows.py \
+  --target-per-mode 4 --quantum-us 25 --max-states 100000
+
+python scripts/study_llm_route_windows.py \
+  --target-per-mode 4 --quantum-us 25 --max-states 100000 --link-only \
+  --output outputs/llm_route_windows/report_link_only.json
+```
+
+本阶段结果没有修改通用 `Task` schema、pipeline builder、serializer、baseline strategy 或 executor。
+
+阶段 1--4b 联合定向回归为 `26 passed`，只读 syntax 检查和 `git diff --check` 通过。全量回归为 `831 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的外部 Spectrum-X topology fixture，没有新增功能失败。当前环境仍未安装 `ruff`。
+
+## 阶段 4c：手工小拓扑与可控冲突实验（2026-08-14）
+
+### 1. 为什么补做这一阶段
+
+阶段 4b 使用 16-GPU AlibabaHPN，而 probe 只占 8 张 GPU，且默认 placement 大量通信位于同一 server 的近无阻塞路径。五种 pipeline 的 ready-pair route conflict 大多为 0%，因此“拓扑 heuristic 没有收益”很可能只是缺少调度机会。
+
+本阶段保留真实 pipeline builder、serializer 和 effective DAG，只把 topology 改成三个透明、可手算的 8-GPU 网络，并显式控制哪个并行维度跨越瓶颈。目标不是模拟某台真实机器，而是做机制实验：如果冲突变强，Dynamic-tail、resource-aware packing 和 set rollout 是否开始分化。
+
+### 2. 三个手工拓扑
+
+#### `single_switch`
+
+8 个 GPU 各通过独立双向 leaf link 连接一个交换机。不同端点 flow 不共享 route edge，是阶段 4b 近无阻塞情况的最小对照。
+
+```text
+GPU0 ... GPU7
+  \       /
+   switch8
+```
+
+#### `two_rack`
+
+GPU 0--3 和 GPU 4--7 分属两个 rack，rack switch 之间只有一对 100 Gbps 有向 uplink。所有同方向跨 rack flow 共享 `(8,9)` 或 `(9,8)`。
+
+```text
+GPU0--3 -- switch8 == shared uplink == switch9 -- GPU4--7
+```
+
+#### `four_rack_core`
+
+每个 rack 有 2 个 GPU，4 个 rack switch 连接同一 core。来自同一 rack 的跨 rack flow 会共享 access-to-core link，适合制造部分重叠而不是把所有通信压成一个 channel。
+
+```text
+GPU0,1--S8  \
+GPU2,3--S9   \
+              core12
+GPU4,5--S10  /
+GPU6,7--S11 /
+```
+
+三个拓扑都继续使用有向 route links 加独立 `NIC-TX/NIC-RX` 资源，不把交换机节点本身粗暴设为容量 1。
+
+### 3. 三种 placement
+
+逻辑 rank 顺序仍为 `[PP][DP][TP]`，每组均使用同样的 8 张 GPU：
+
+| placement | assigned nodes | 目的 |
+|---|---|---|
+| `pp_cross` | `0,1,2,3,4,5,6,7` | stage 0/1 位于不同 rack，使 PP 跨瓶颈 |
+| `dp_cross` | `0,1,4,5,2,3,6,7` | 每个 stage 的 DP replica 分居 rack |
+| `tp_cross` | `0,4,1,5,2,6,3,7` | 每个 TP pair 跨 rack，故意制造高冲突 |
+
+正式矩阵使用 `ga=2,layers=2,quantum=25 us`，研究 1F1B 与 Bidirectional，共 `3 topology × 3 placement × 2 pipeline = 18` 个完整场景。
+
+### 4. 冲突确实被制造出来了
+
+18 个场景的平均 ready-pair conflict fraction 为 **15.15%**，其中 15/18 出现至少一次策略动作分歧。相比阶段 4b 的 0--3.4%，手工小拓扑显著扩大了可调度空间。
+
+1F1B 的代表性结果：
+
+| topology / placement | conflict fraction | disagreement ticks | Dynamic-tail | Resource-tail | Bottleneck-first | LPT |
+|---|---:|---:|---:|---:|---:|---:|
+| single-switch / 任意 | 0% | 0 | 758 | 758 | 758 | 758 |
+| two-rack / PP-cross | 29.2% | 12 | **766** | 768 | 768 | 769 |
+| two-rack / DP-cross | 7.6% | 6 | 762 | 762 | 762 | 762 |
+| two-rack / TP-cross | 21.1% | 2 | 771 | 771 | 771 | 772 |
+| four-rack / TP-cross | 25.7% | 16 | 765 | 765 | **764** | 773 |
+
+Bidirectional 对冲突更加敏感。最强场景 `four-rack-core + TP-cross` 为：
+
+```text
+Dynamic-tail       782
+Resource-tail      780
+Bottleneck-first   777
+LPT                787
+```
+
+在 18 个完整场景中，有 8 个场景的 Dynamic-tail 不是四种快速 heuristic 中的 best observed。最大快速改进发生在上述 Bidirectional 场景：Bottleneck-first 相对 Dynamic-tail 减少 5 tick，即约 **0.64%**。
+
+### 5. 资源优先不是普遍改进
+
+小拓扑同时产生了正例和反例：
+
+- four-rack TP-cross 中，优先清理热点资源有收益；
+- two-rack PP-cross 1F1B 中，Dynamic-tail=766，而 Resource-tail/Bottleneck-first=768，反而退化 2 tick；
+- two-rack TP-cross Bidirectional 中，Dynamic-tail=780，而两个资源策略均为782。
+
+因此正确结论不是“拓扑小了以后 Bottleneck-first 更好”，而是：
+
+> route load 是有效信息，但不能脱离 DAG unlock/tail 独立排序；需要端到端集合评价来判断当前是应保护关键链，还是先释放共享瓶颈。
+
+### 6. 完整图 Set Rollout
+
+对冲突最强的 `four-rack-core + TP-cross` 单独运行昂贵的完整图 rollout：
+
+| pipeline | LB | Dynamic-tail | Bottleneck-first | Rollout-2 | **Rollout-4** |
+|---|---:|---:|---:|---:|---:|
+| 1F1B，304 tasks | 758 | 765 | 764 | 765 | **762** |
+| Bidirectional，400 tasks | 768 | 782 | 777 | 779 | **775** |
+
+这给出了本阶段最明确的算法进步：
+
+- 1F1B 中 Rollout-4 比 Dynamic-tail 减少 3 tick（0.39%），并把相对 LB gap 从 7 降到 4；
+- Bidirectional 中 Rollout-4 减少 7 tick（0.90%），把相对 LB gap 从 14 降到 7；
+- Rollout-2 在两个场景中都明显弱于 Rollout-4，阶段 4a/4b 的“top-2 已够”不能外推到高冲突拓扑；
+- 这些仍是更好的可行解，不是 exact full-DAG OPT，因为当前 LB 尚未闭合。
+
+代价也非常明显。快速 heuristic 的 Python 原型约 0.8--1.3 秒；完整 Rollout-4 约 36--42 秒，慢约两个数量级。因此 Rollout-4 当前适合作为离线 teacher/upper-bound 搜索，不适合作为在线默认策略。
+
+### 7. Exact 小窗口结果及其限制
+
+从18个完整场景中提取了43个 depth-0 exact 窗口，其中10个能区分至少一种算法：
+
+| method | mean ratio | observed max | optimal fraction |
+|---|---:|---:|---:|
+| Dynamic-tail / Resource-tail / Bottleneck-first | 1.00000 | 1.00000 | 100% |
+| SPT | 1.00465 | 1.20000 | 97.67% |
+| LPT | 1.04208 | 1.33333 | 79.07% |
+| Set Rollout-2 | 1.00000 | 1.00000 | 100% |
+
+这些窗口证明简单 LPT/SPT 会在局部冲突上犯错，但没有解释完整图中 Resource/Bottleneck/Rollout 的差异。对最强 Bidirectional 场景继续尝试 depth-1/2，strong methods 仍全部命中窗口 OPT。
+
+原因是完整图的 1--7 tick 差异来自多个相隔较远的选择累积，而 boundary tail 把后续复杂状态压成一条 compute proxy。由此得到一个方法论修正：
+
+> 对拓扑冲突，单个 depth-0 decision window 可以检查动作合法性和短期错误，但不足以评价跨多个 collective wave 的长期资源占用；下一步需要 multi-event window、保留资源 demand profile 的 boundary state，或完整图的更强 lower bound/branch-and-bound certificate。
+
+### 8. 当前结论
+
+用户提出的“先手工构造小拓扑”已经得到肯定答案：
+
+1. 原 AlibabaHPN probe 的冲突确实偏少，不能充分区分 topology heuristic；
+2. 加入可解释的共享 uplink/core 后，冲突从接近 0 提升到最高约29%；
+3. Resource-aware heuristic 开始产生正收益，但也存在明确退化反例；
+4. Set Rollout-4 在两个完整 LLM-structured DAG 上均优于 Dynamic-tail 和 Rollout-2；
+5. 改进幅度目前小于1%，但它是首次在真实 builder/effective DAG 加手工 route bottleneck 上观察到的稳定方向；
+6. 下一步应优化候选集合生成和 lookahead，而不是简单扩大 `k` 后直接上线。
+
+### 9. 下一步
+
+1. 候选集合由 `Dynamic-tail top-k` 改成多样化集合：至少保留 Dynamic、Bottleneck、PP/DP deadline 和一组最大资源互补集合；
+2. 用两阶段 rollout：第一层比较集合，第二层只在分歧资源上展开，争取接近 Rollout-4 质量但把开销降到毫秒级；
+3. 为完整图构造更强的 per-resource release/deadline demand bound，判断762/775距离 OPT 还有多少；
+4. 将窗口 boundary 从单一 tail 改为 `(critical tail, per-resource future demand, next collective release)`；
+5. 最后用真实 GPT AICB + oversubscribed topology 验证手工拓扑上发现的收益是否保留。
+
+### 10. 产物与复现
+
+- 手工拓扑、placement、矩阵与 focused rollout：`scripts/study_small_topology_sensitivity.py`
+- 拓扑语义测试：`tests/test_study_small_topology_sensitivity.py`
+- 正式矩阵：`outputs/small_topology_sensitivity/report.json`
+- focused 结果：`outputs/small_topology_sensitivity/focused_1f1b.json`、`focused_bidirectional.json`
+- 复现命令：
+
+```bash
+python scripts/study_small_topology_sensitivity.py \
+  --modes 1f1b bidirectional --target-per-scenario 3
+
+python scripts/study_small_topology_sensitivity.py \
+  --focused-only --modes 1f1b \
+  --output outputs/small_topology_sensitivity/focused_1f1b.json
+
+python scripts/study_small_topology_sensitivity.py \
+  --focused-only --modes bidirectional \
+  --output outputs/small_topology_sensitivity/focused_bidirectional.json
+```
+
+阶段 4c 拓扑相关定向回归为 `15 passed`，只读 syntax 检查与 `git diff --check` 通过。全量回归为 `835 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的外部 Spectrum-X topology fixture，与本阶段无关。当前环境未安装 `ruff`。
+
+## 六、阶段 4：利用 LLM DAG 的特殊结构（2026-08-15）
+
+### 1. 研究方法：语义用于生成候选，不直接叠加 bonus
+
+阶段 3 已证明 raw join bonus 会重复奖励，阶段 4c 又证明单独的 Bottleneck-first 有正例也有反例。因此本阶段不构造统一线性分数，而是为同一个 residual state 生成少量、语义不同但都合法的 maximal compatible sets：
+
+```text
+Dynamic-tail / Bottleneck / Resource-complement
+Backbone-first / Optimizer-deadline / Deferred gap-fill
+Dimension round-robin / DP replica wavefront / Ring chunk wavefront
+```
+
+每个候选仍使用统一的端到端评价：执行到 next event，再用 Dynamic-tail 补全剩余 schedule。完整 Dynamic-tail schedule 保留为 incumbent。LLM 特征只负责回答“还值得评估哪些动作”，最终选择仍由预测 makespan 决定，不会因相关特征重复加分。
+
+### 2. Analyzer-owned LLM sidecar
+
+没有修改通用 `Task` schema。研究 sidecar 为每条 flow 保存：
+
+- PP/TP/DP/EP dimension 和 forward/backward phase；
+- iteration、layer、item、stage；
+- Ring `chunk_id/num_chunks`；
+- 物理 src/dst/route；
+- 根据 job 的 `[PP][DP][TP]` assigned-node 顺序恢复的逻辑坐标。
+
+当前角色定义为：
+
+```text
+backbone = PP/TP flow 且 phase 属于 forward/backward_input
+deferred = DP flow 或 backward_weight flow
+```
+
+Optimizer slack 的首版近似为：
+
+\[
+slack(v)=LB_{residual}-\bigl(p_v+tail_v\bigr).
+\]
+
+它比 raw join duration 更接近“还能推迟多久”，但仍不是严格 latest-start time，因为没有显式求 optimizer deadline 和未来 bandwidth waiting。
+
+### 3. Teacher 覆盖率
+
+在阶段 4c 最强的 `four-rack-core + TP-cross` 场景中，对每个 conflict event 枚举全部 maximal compatible sets，执行一次 next-event 后用 Dynamic-tail 补全，得到 exhaustive one-event teacher。teacher 是确定的反事实上界选择器，不是 full-DAG exact OPT。
+
+| pipeline | choice events | mean exhaustive sets | mean semantic sets | value coverage | action coverage |
+|---|---:|---:|---:|---:|---:|
+| 1F1B | 26 | 4.77 | 1.81 | **100%** | **100%** |
+| Bidirectional | 40 | 6.70 | 2.10 | **100%** | **100%** |
+
+语义候选把每次需要评价的集合数减少约62%和69%，同时覆盖全部 teacher-optimal value/action。
+
+第一版 sidecar 只有 phase/stage/layer，1F1B 覆盖率为96.15%。唯一漏掉的 event 是四条同模板 TP flow：teacher 选择 DP replica 0，而 Dynamic-tail 因1 tick tail差异选择 replica 1。加入逻辑 DP 坐标后的 `replica_wavefront` 将覆盖率补到100%。
+
+Bidirectional 第一版覆盖率为97.5%。唯一漏掉的两条 flow 连 endpoint、route、phase、stage、replica 都相同，只差 Ring `chunk_id`；teacher 选择 chunk 1，Dynamic-tail 选择 chunk 0。加入 `chunk_wavefront` 后也达到100%。这说明并行坐标和collective内部结构具有实际信息量，不只是给已有tail换名字。
+
+### 4. 完整 DAG 结果与消融
+
+使用 `ga=2,layers=2,quantum=25 us` 的真实 builder/effective DAG，拓扑为 four-rack shared core，placement 为 TP-cross。
+
+`Topology-only rollout` 只允许 Dynamic、Bottleneck、Resource-complement；`Semantic rollout` 再加入 backbone、deferred/deadline、dimension、replica 和 chunk 候选。
+
+| pipeline | LB | Dynamic | Bottleneck | Topology-only | Semantic | 先前 Rollout-4 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1F1B | 758 | 765 | 764 | 764 | **762** | 762 |
+| Bidirectional | 768 | 782 | 777 | 776 | **773** | 775 |
+
+结论：
+
+1. 1F1B 中 topology-only 只关闭1/7的LB gap；加入LLM语义后关闭3/7并追平Rollout-4；
+2. Bidirectional 中 topology-only 从782降到776，语义候选继续降到773，比Rollout-4还好2 tick；
+3. 相对Dynamic-tail，Semantic rollout分别改善3 tick（0.39%）和9 tick（1.15%）；
+4. 相对相同counterfactual框架的Topology-only，LLM语义的独立边际收益为2 tick和3 tick；
+5. 这些是更好的可行解，不是OPT；最终相对下界gap仍为4和5。
+
+1F1B 的最终动作使用为 Dynamic 73次、Replica-wavefront 1次、Bottleneck 2次、Chunk-wavefront 1次。Bidirectional 为 Dynamic 88次、Replica-wavefront 1次、Dimension-round-robin 1次、Chunk-wavefront 3次、Deferred-gap-fill 3次。
+
+收益不是“所有LLM规则频繁介入”，而是绝大多数event沿用Dynamic-tail，仅在少数对称replica/chunk或跨维度冲突点引入替代集合。
+
+### 5. 特征证据边界
+
+已有直接证据：
+
+- DP replica wavefront 修复1F1B唯一teacher miss，并在完整schedule实际被选择；
+- Ring chunk wavefront 修复Bidirectional唯一teacher miss，并被选择3次；
+- Dimension round-robin 在Bidirectional被选择1次；
+- 语义候选组合相对Topology-only获得2/3 tick独立收益。
+
+尚无独立makespan贡献证明：
+
+- Optimizer-deadline 在teacher中命中少量event，但高冲突完整schedule没有选择；
+- Deferred gap-fill 在Bidirectional teacher命中7个event且完整schedule选择3次，但还缺少移除该候选的单特征消融；
+- Backbone-first 大多与Dynamic-tail生成相同集合，没有观察到独立候选增量。
+
+因此不能宣称 backbone/deferred 策略已经完成；下一步需要 leave-one-feature-out 消融和 W/DP overlap 更强的DAG。
+
+### 6. 周期性结果
+
+按不含microbatch编号的 `(dimension, phase, stage, layer)` 压缩ready frontier：
+
+| pipeline | unique templates | repeated templates | action consistency |
+|---|---:|---:|---:|
+| 1F1B | 9 | 7 | 82.86% |
+| Bidirectional | 27 | 8 | 68.75% |
+
+存在明显重复，但同一粗模板不能唯一决定动作，差异来自replica/chunk位置、residual duration和resource load。因此周期表只能作为候选或缓存key；更合理的key应加入 `(replica wave, chunk progress, bottleneck-load bucket)`。
+
+### 7. 开销与部署定位
+
+高冲突场景中快速贪心约0.6--1.8秒，语义Rollout约28.7秒和31.8秒，先前Rollout-4约41.7秒和36.2秒。语义候选减少了集合数，但Python原型仍反复完整补全schedule，尚不适合在线。
+
+当前价值是离线teacher和策略发现。下一步应缓存周期状态的continuation value，并只在 `unique_candidates > 1` 且存在真实资源冲突时调用lookahead。
+
+### 8. Zero Bubble 暂不纳入性能结论
+
+当前ZB effective DAG仍保留 `B -> W` 依赖，W没有在DAG层面真正脱离B关键链。若直接实验，候选生成器看不到真实ZB允许的W滞后自由度。应先在隔离研究路径建立 `F -> B`、`F -> W`、无 `B -> W` 的语义版本，再验证deferred-W，不能由serializer顺序代替因果依赖。
+
+### 9. 当前推荐原型
+
+```text
+Dynamic-tail packed incumbent
+  + topology candidates: bottleneck / resource-complement
+  + LLM candidates:
+      backbone / deferred-deadline / dimension
+      replica-wavefront / chunk-wavefront
+  + next-event end-to-end counterfactual
+  + periodic continuation cache（待实现）
+```
+
+关键变化是：调度器选择兼容flow集合，LLM结构只扩展少量候选；不把全部特征相加成一个priority。
+
+### 10. 下一步
+
+1. 对optimizer-deadline、deferred-gap、replica、chunk做leave-one-out完整消融；
+2. 将粗slack替换为optimizer latest-start和join后resource-aware critical tail；
+3. 设计 `(template, replica, chunk, load bucket)` 周期缓存，减少完整补全次数；
+4. 用更强per-resource release/deadline lower bound认证762/773的剩余gap；
+5. 建立隔离的ZB B/W解耦研究DAG，再验证deferred-W；
+6. 最后接入真实GPT AICB profile，检查收益能否跨profile保留。
+
+### 11. 产物与复现
+
+- LLM sidecar、候选、teacher覆盖与语义rollout：`scripts/study_llm_structured_candidates.py`
+- route-aware sidecar扩展：`scripts/study_llm_route_windows.py`
+- 回归测试：`tests/test_study_llm_structured_candidates.py`
+- 正式高冲突报告：`outputs/llm_structured_candidates/report_high_conflict.json`
+- 完整正/负对照报告：`outputs/llm_structured_candidates/report.json`
+- 复现命令：
+
+```bash
+python scripts/study_llm_structured_candidates.py \
+  --modes 1f1b bidirectional \
+  --topologies four_rack_core \
+  --output outputs/llm_structured_candidates/report_high_conflict.json
+```
+
+阶段4相关定向回归为 `18 passed`，只读 syntax 检查与 `git diff --check` 通过。全量回归为 `838 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的外部 Spectrum-X topology fixture，与本阶段无关。当前环境未安装 `ruff`。
+
+## 七、阶段 4 收尾：压缩搜索、安全分区与隔离 ZB（2026-08-09）
+
+### 1. 更强的多资源下界
+
+在原有 `max(critical path, max per-resource load)` 上加入了逐资源 release/deadline demand bound。对每条 route resource，使用 precedence-only earliest release 和 residual downstream tail 构造必要时间窗；若某个区间内必须经过该资源的通信总量大于区间长度，则候选 horizon 不可行。不同资源独立检查，因此它仍是合法下界，不假设多跳 flow 可以分拆执行。
+
+该下界使用单调二分搜索，只定位为离线认证/搜索剪枝工具。新测试在一个“compute release 后两条共享链路 flow、随后各有 tail”的例子上得到：
+
+```text
+critical path = 11
+max resource load = 6
+resource-window LB = OPT = 14
+```
+
+在高冲突 ZB probe 原图上，它也把 `critical_path=726` 收紧到 `combined=730`，而 Dynamic-tail 为733，未认证 gap 从7缩到3。
+
+### 2. Frontier-state 与周期缓存
+
+阶段4的 semantic candidate portfolio 本身就是一种压缩 frontier search：不枚举全部 maximal compatible sets，只保留 Dynamic、拓扑瓶颈、backbone/deferred、dimension、replica 和 chunk 等少量代表集合，再做 next-event counterfactual。
+
+新增两级周期 key：
+
+```text
+detailed = (template, replica, TP position, chunk, route width,
+            residual-duration bucket, bottleneck-load bucket)
+coarse   = (template, replica, TP position, chunk, route width)
+```
+
+缓存只复用“候选标签”，每次仍重新生成当前状态下的合法 compatible set；完整 Dynamic-tail schedule 始终作为最终 incumbent，因此 key alias 不会让返回结果差于 Dynamic-tail。
+
+| pipeline | key | hits / decisions | makespan | runtime |
+|---|---|---:|---:|---:|
+| 1F1B | detailed | 0 / 77 | 762 | 13.17 s |
+| 1F1B | coarse | 30 / 77 | 762 | 8.79 s |
+| Bidirectional | detailed | 1 / 96 | 773 | 18.58 s |
+| Bidirectional | coarse | 10 / 96 | 773 | 17.04 s |
+
+结论是周期复用确实可用，但 load/remaining 放进 key 会使状态几乎不重复；去掉它们后，1F1B 的命中率约39%、原型时间下降约33%，Bidirectional 只有约10%命中和8%左右降时。周期策略不能脱离 pipeline 模式单独宣称有效。
+
+### 3. Leave-one-feature-out 结果
+
+在 `four-rack-core + TP-cross, ga=2, layers=2` 上共享 continuation cache，逐个移除语义候选族：
+
+| removed feature | 1F1B | Bidirectional |
+|---|---:|---:|
+| none | **762** | **773** |
+| backbone | 762 | 773 |
+| optimizer deadline | 762 | 773 |
+| deferred gap-fill | 762 | 773 |
+| dimension round-robin | 762 | 775 |
+| replica wavefront | 764 | 776 |
+| chunk wavefront | 762 | 773 |
+
+因此当前可归因的独立贡献只有：1F1B 的 replica wavefront（2 tick），以及 Bidirectional 的 replica wavefront（3 tick）和 dimension round-robin（2 tick）。Deferred-gap 和 chunk 候选虽然在完整轨迹中被选择过，但移除后有替代候选得到相同端到端结果；不能把“被选择次数”解释成独立收益。Backbone 和 optimizer-deadline 当前也没有独立证据。
+
+### 4. 安全 DAG 分区
+
+实现了最保守的 strict-series partition：只有当一个节点与 DAG 中所有其他节点都存在明确先后关系时，才把它当作全局 barrier 切分。该条件保证 barrier 两侧不能重叠，局部最优解才可以严格串联。
+
+38 个完整 topology/effective-DAG 参数点中，`exact_composition_safe` 全部为 false。也就是说，当前单 iteration LLM DAG 中没有可用于“大量小问题独立求解再拼接”的非平凡全局切口。Dominator/SESE region 仍可用于压缩状态，但边界必须携带 Pareto demand profile，不能输出一个局部 schedule 后直接拼接。这个负结果支持前面“动态 frontier 而非硬切 DAG”的路线修正。
+
+### 5. 隔离的真实 ZB B/W 语义
+
+没有修改生产 builder。研究脚本复制 Zero Bubble effective DAG，并按同一 `(node, iteration, layer, item)`：
+
+1. 删除 W 对同一 B compute 及其 backward-input collective completion 的直接依赖；
+2. 加入对应 `F -> W`；
+3. 保留 W 后的 DP 和 optimizer gating。
+
+本例改变48个W节点，删除80条B/IG-result到W的边，加入48条F到W的边。结果为：
+
+| DAG | LB | Dynamic-tail | Bottleneck-first |
+|---|---:|---:|---:|
+| 当前 builder ZB | 730 | 733 | 732 |
+| 隔离 B/W 解耦 | 726 | 729 | 728 |
+
+解耦使 critical chain 和两个可行 schedule 都缩短4 tick，证明原 `B -> W` 确实会改变可调度空间；但 heuristic 相对 LB 的 gap 没有改善，当前实例仍没有证明 deferred-W 规则优于一般 bottleneck 策略。它只能作为语义对照，不能替代正式修复 builder 后的 executor 验证。
+
+## 八、阶段 5：统一评测（2026-08-09）
+
+### 1. 评测范围
+
+统一入口 `scripts/study_heuristic_plan_completion.py` 汇总：
+
+- 30个随机并行链 exact/伪多项式 DP；
+- 53个一般小 DAG（对抗、LLM motif、真实缩减和30个随机 join DAG）的 exact oracle；
+- 38个完整 route-aware effective DAG 参数点，覆盖1F1B、当前ZB、Interleaved、Bidirectional、DualPipe，single-switch/four-rack-core，不同GA、层数、量化及通信缩放；
+- 两种高冲突 pipeline 的语义消融和周期缓存；
+- 真实 GPT-13B AICB + 16-GPU AlibabaHPN 的 route-aware 缩减。
+
+完整拓扑模型报告 makespan、相对LB、network idle和Python调度时间。当前研究模型把 compute 当作 precedence-only 并行任务，未建模物理GPU互斥、activation memory和max-min bandwidth sharing，所以没有伪造“GPU idle、activation violation、真实抢占次数”这三个指标；这些只能在生产 executor 集成后测量。
+
+### 2. 单通道 exact 结果
+
+30个随机并行链中：Longest-tail、Rollout-2/4、Beam-8/32和MC-64本批样本均命中OPT；LRPT/earliest-slack observed max为1.05。FIFO、SPT、LPT、Longest-delay/TicTac的observed max分别为1.5714、1.3667、1.4762和1.35。该结果只是有限样本表现；先前构造的9/8 Longest-tail族和趋近2的通用work-conserving反例仍然有效，不能由本批“全部最优”推出更强近似比。
+
+53个一般 DAG 中：
+
+| method | mean ratio | observed max | optimal fraction | mean runtime |
+|---|---:|---:|---:|---:|
+| Longest-tail | 1.00411 | 1.125 | 94.34% | 0.64 ms |
+| Dynamic-tail | **1.00176** | **1.04762** | 96.23% | 1.05 ms |
+| Gate-dynamic-tail | 1.00270 | 1.05 | 94.34% | 1.00 ms |
+| Rollout-2/4/8 | 1.00000 | 1.00000 | 100% | 12.2--14.0 ms |
+| Beam-8 | 1.00000 | 1.00000 | 100% | 111.9 ms |
+
+Raw gate 特征再次略微伤害平均值和最优率；Dynamic-tail 是最有价值的低成本基线。Rollout 在该有限 suite 上最优，但没有小于2的最坏界证明，且开销高一个数量级以上。
+
+### 3. 按 P/Q 分层的完整拓扑结果
+
+这里 `P=max per-resource route load`，`Q=precedence path 上的纯 compute load`。为覆盖通信主导区域，额外对通信 duration 做8/16/32倍 profile scaling；这些点是敏感性实验，不是实测带宽。
+
+| stratum | scenarios | Dynamic | Resource-tail | Bottleneck | SPT | LPT |
+|---|---:|---:|---:|---:|---:|---:|
+| compute dominated | 33 | 1.01026 | 1.01018 | **1.00471** | 1.01121 | 1.01786 |
+| balanced `P≈Q` | 4 | 1.10066 | **1.09601** | 1.14214 | 1.17130 | 1.56870 |
+| communication dominated | 1 | 1.23888 | **1.23211** | 1.42408 | 1.30368 | 2.28723 |
+
+表中是 mean `makespan/LB`，不是 approximation ratio，因为完整图没有OPT。主要结论：Bottleneck-first 在compute-dominated点表现最好，却在平衡/通信主导点明显退化；Resource-tail跨分层最稳定，Dynamic-tail非常接近；LPT在通信主导点极差。LLM-specific semantic rollout的0.39%/1.15%收益只在两个高冲突点验证，尚未达到“多组参数稳定提升”的退出条件。
+
+### 4. 真实 GPT-13B AICB profile
+
+新增真实 profile 入口使用未修改的：
+
+```text
+A100 GPT-13B, world=16, TP=8, PP=2, DP=1, GA=8
+AlibabaHPN 16-GPU topology, BFS routes
+```
+
+完整 effective DAG 有48,416个任务、130,992条有效边和39,776条flow，其中TP 39,648、PP 128；全部flow route为2 hop。原 dominance 审计在该规模上因平方空间触发 `MemoryError`，因此真实入口改用线性的 data-edge + serializer-edge exporter，只跳过全量dominance集合，不改变有效依赖。
+
+从最密集的3个时间桶各保留2条seed flow，使用100 ms量化做exact缩减。三个窗口分别有94/96/96个任务；DP在5万状态内没有完成枚举，但三种可行heuristic均得到56，且新的resource-window LB也为56，因此三个窗口都由“可行解=下界”直接认证最优。它们没有区分Dynamic-tail、Resource-tail和Bottleneck-first。
+
+这说明真实AICB profile已完成结构、route、缩减和certificate闭环，但当前配置 `DP=1`、TP占99.7%的flow，不能验证deferred DP或多维重叠流量。下一轮真实实验应选择或生成 `TP/DP/PP` 同时非1的AICB，而不是从这个负结果推出heuristic无效。
+
+### 5. 最终判断与退出条件
+
+规划中的研究基础设施已经实现完毕，但“研究计划实现完成”不等于“算法已满足上线条件”：
+
+1. 单通道2-近似安全底座、exact oracle、反例、一般DAG rollout、多资源模型、LLM候选压缩、周期缓存、安全分区和统一评测均已闭环；
+2. 没有得到多资源一般DAG的常数近似保证；`makespan/LB`不能冒充近似比；
+3. LLM特化在1F1B和Bidirectional各有正收益，但只验证一个高冲突参数点，未满足“多组参数稳定改进”；
+4. 离线semantic rollout即使有缓存仍需8.8--17.0秒，远高于贪心的亚秒到约2秒，未满足“收益大于运行时开销”；
+5. 真实GPT AICB缩减闭环完成，但该profile没有DP维度且窗口内算法无差异；
+6. 因而当前推荐仍是：生产候选为增量Dynamic/Resource-tail；semantic rollout作为离线teacher。暂不接入executor默认策略，也不宣称优于2的理论保证。
+
+### 6. 产物与复现
+
+- 阶段4/5统一入口、安全分区、ZB隔离和真实AICB缩减：`scripts/study_heuristic_plan_completion.py`
+- 多资源window lower bound：`scripts/study_multiresource_dag.py`
+- 真实AICB route adapter：`scripts/study_llm_route_windows.py`
+- 周期缓存与特征消融：`scripts/study_llm_structured_candidates.py`
+- 正式综合报告：`outputs/heuristic_plan_completion/report.json`
+- 真实GPT报告：`outputs/heuristic_plan_completion/real_gpt_aicb.json`
+- 新增回归：`tests/test_study_heuristic_plan_completion.py`及三个对应研究脚本测试。
+
+```bash
+python scripts/study_heuristic_plan_completion.py \
+  --samples 30 --include-expensive \
+  --output outputs/heuristic_plan_completion/report.json
+
+python scripts/study_heuristic_plan_completion.py \
+  --real-aicb-only \
+  --output outputs/heuristic_plan_completion/real_gpt_aicb.json
+```
+
+本轮相关定向回归为 `45 passed`，只读syntax检查与`git diff --check`通过。完整测试集为 `843 passed, 3 skipped, 18 errors`；18个error全部是仓库已知的外部Spectrum-X fixture缺失。本轮没有修改通用Task/schema/executor、baseline策略或高级流水线builder。
