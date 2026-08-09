@@ -44,6 +44,7 @@ from scripts.study_multiresource_dag import (  # noqa: E402
 from src.static_analysis.passes.routing import BfsStrategy  # noqa: E402
 from src.static_analysis.passes.topology_loader import TopologyLoader  # noqa: E402
 from src.static_analysis.passes.topology_loader import NetworkTopology  # noqa: E402
+from src.static_analysis.passes.hermod_placement import assigned_nodes_for  # noqa: E402
 from src.workload_format.schema import Job, ParallelismConfig  # noqa: E402
 from src.workload_generator.aicb_parser import AicbParser  # noqa: E402
 
@@ -223,6 +224,9 @@ def build_route_aware_aicb(
     mode: str = "1f1b",
     quantum_us: float = 100.0,
     include_nic_resources: bool = True,
+    dp_override: int | None = None,
+    placement: str = "contiguous",
+    gpus_per_server: int = 8,
 ) -> tuple[MultiResourceInstance, dict, dict]:
     """Bind an unmodified repository AICB profile to its physical BFS routes."""
 
@@ -232,12 +236,29 @@ def build_route_aware_aicb(
         raise ValueError(
             f"AICB needs {header.all_gpus} GPUs; topology has {len(topology.gpu_nodes)}"
         )
-    dp = header.all_gpus // (header.tp * header.pp)
+    header_dp = header.all_gpus // (header.tp * header.pp)
+    dp = header_dp if dp_override is None else dp_override
+    if dp < 1:
+        raise ValueError("dp_override must be positive")
+    if dp % header.ep:
+        raise ValueError(f"DP={dp} must be divisible by EP={header.ep}")
+    parallelism = ParallelismConfig(tp=header.tp, dp=dp, pp=header.pp, ep=header.ep)
+    required_gpus = header.tp * dp * header.pp
+    if required_gpus > len(topology.gpu_nodes):
+        raise ValueError(
+            f"expanded AICB needs {required_gpus} GPUs; "
+            f"topology has {len(topology.gpu_nodes)}"
+        )
+    logical_nodes = assigned_nodes_for(parallelism, placement, gpus_per_server)
+    if not set(logical_nodes) <= set(topology.gpu_nodes):
+        raise ValueError(
+            f"placement {placement!r} produced nodes outside the topology GPU set"
+        )
     job = Job(
         job_id=0,
         name=f"aicb-{aicb_path.stem}",
-        assigned_nodes=topology.gpu_nodes[:header.all_gpus],
-        parallelism=ParallelismConfig(tp=header.tp, dp=dp, pp=header.pp, ep=header.ep),
+        assigned_nodes=logical_nodes,
+        parallelism=parallelism,
     )
     built = build_mode(
         mode, header, items, job,
@@ -381,8 +402,12 @@ def build_route_aware_aicb(
         "source": str(aicb_path),
         "header": {
             "tp": header.tp, "dp": dp, "pp": header.pp, "ep": header.ep,
-            "ga": header.ga, "all_gpus": header.all_gpus,
+            "ga": header.ga, "header_all_gpus": header.all_gpus,
+            "expanded_all_gpus": required_gpus,
+            "header_dp": header_dp,
+            "dp_override": dp_override,
         },
+        "placement": placement,
         "effective_metrics": metrics,
         "tasks": len(tasks),
         "flows": len(resources),

@@ -2187,4 +2187,184 @@ python scripts/study_heuristic_plan_completion.py \
   --output outputs/heuristic_plan_completion/real_gpt_aicb.json
 ```
 
-本轮相关定向回归为 `45 passed`，只读syntax检查与`git diff --check`通过。完整测试集为 `843 passed, 3 skipped, 18 errors`；18个error全部是仓库已知的外部Spectrum-X fixture缺失。本轮没有修改通用Task/schema/executor、baseline策略或高级流水线builder。
+本轮相关定向回归为 `45 passed`，只读syntax检查与`git diff --check`通过。当时完整测试集为 `843 passed, 3 skipped, 18 errors`；后续阶段9加入测试后的最新总数见下文。18个error全部是仓库已知的外部Spectrum-X fixture缺失。本轮没有修改通用Task/schema/executor、baseline策略或高级流水线builder。
+
+## 九、真实多维 AICB 与 max-min executor 验证（2026-08-09）
+
+### 1. Workload 筛选与 DP 覆盖语义
+
+扫描了 `inputs/aicb-workload` 下936份AICB。文件覆盖GPT-7B/13B/22B/175B、Mixtral和Llama，不同TP、PP、EP、GBS、MBS与GA；但按文件名和header计算，现有文件都满足：
+
+```text
+header_all_gpus = TP × PP
+header_DP = 1
+```
+
+因此不能声称原始文件自带多维DP。本阶段沿用仓库Hermod/Puppeteer实验已经验证的语义：保持AICB中每rank的compute/communication profile不变，通过`dp_override`扩大`Job.parallelism.dp`和assigned nodes，使builder按新的DP group展开真实DP collective。
+
+选取的主配置为：
+
+```text
+GPT-7B / GPT-13B / GPT-22B
+TP=4, PP=2, DP override=2, GA=8
+AlibabaHPN 16-GPU, contiguous / cyclic_pp_dp
+```
+
+扩展验证使用：
+
+```text
+GPT-13B, TP=4, PP=2, DP=2, GA=2/4/8
+GPT-13B, TP=4, PP=2, DP=4, GA=4
+Hermod 32-GPU topology
+```
+
+`build_route_aware_aicb`现支持`dp_override`、`contiguous/cyclic_pp_dp`和`gpus_per_server`，报告同时记录header DP和expanded DP，避免语义混淆。
+
+### 2. 隔离的真实 executor heuristic
+
+新增`scripts/study_real_aicb_executor_heuristics.py`。它不注册生产policy，而是复用：
+
+- 真实AICB parser和WorkloadBuilder/高级pipeline builder；
+- pipeline serializer产生的compute order；
+- BFS route；
+- `AnalyticalExecutor`；
+- 真实链路容量；
+- Hermod allocator同口径的逐tier progressive-filling max-min分配。
+
+Default对所有active flow做普通fair-share；研究policy按照effective-DAG downstream tail构造严格优先tier，同一tail内继续max-min，低优先级只使用高优先级留下的链路容量。由于ready/active flow的所有后继必然尚未完成，其static downstream tail与该flow的residual downstream tail一致。Resource-tail额外维护所有未完成flow的per-link residual bytes；任务完成时增量扣减，不重扫完整DAG。
+
+同一实验的route和compute order完全相同，只改变bandwidth allocation。报告记录：
+
+- makespan；
+- PP flow完成到直接下游compute启动的unlock delay；
+- allocation calls与真实链路冲突calls；
+- paused assignments和真实正带宽到零带宽的preemption；
+- allocator/executor Python wall-clock。
+
+早期遥测曾把正常完成flow离开active set误计为preemption，已经修正为“仍active且正带宽变零”才计数，后续正式数据使用修正口径。
+
+### 3. DP=2、GA=8的跨模型结果
+
+#### Bidirectional
+
+| model | placement | conflict calls | Default (us) | Dynamic-tail (us) | improvement |
+|---|---|---:|---:|---:|---:|
+| GPT-7B | contiguous | 238 | 2,029,788 | 1,942,558 | **4.30%** |
+| GPT-7B | cyclic | 332 | 2,048,330 | 2,023,624 | **1.21%** |
+| GPT-13B | contiguous | 257 | 2,865,630 | 2,723,615 | **4.96%** |
+| GPT-13B | cyclic | 299 | 2,888,844 | 2,851,646 | **1.29%** |
+| GPT-22B | contiguous | 265 | 4,453,576 | 4,155,197 | **6.70%** |
+| GPT-22B | cyclic | 308 | 4,431,851 | 4,358,662 | **1.65%** |
+
+严格tail优先在3个模型、两种placement上全部为正。Contiguous收益更大；cyclic虽然制造更多冲突，但跨更慢链路的通信基线更长，能由调度关闭的比例反而较小。
+
+这6个场景中Dynamic-tail、Resource-tail、Bottleneck-first和完整LLM tie最终makespan相同。当前证据支持的是“关键链严格优先优于全流fair-share”，不支持resource load或LLM语义在DP=2下有独立贡献。
+
+#### 1F1B负对照
+
+| model | placement | Default (us) | Dynamic-tail (us) | change |
+|---|---|---:|---:|---:|
+| GPT-7B | contiguous | 1,787,639 | 1,787,639 | 0 |
+| GPT-7B | cyclic | 1,863,921 | 1,863,970 | -0.0026% |
+| GPT-13B | contiguous | 2,431,784 | 2,431,784 | 0 |
+| GPT-13B | cyclic | 2,551,447 | 2,551,795 | -0.0136% |
+| GPT-22B | contiguous | 3,659,163 | 3,659,163 | 0 |
+| GPT-22B | cyclic | 3,849,759 | 3,849,534 | +0.0058% |
+
+1F1B的变化都接近零。其expanded workload只有32条DP flow，而Bidirectional因双副本梯度同步有224条DP flow；后者才形成足够长的共享链路竞争窗口。不能把Bidirectional收益外推到普通1F1B。
+
+### 4. GA敏感性
+
+GPT-13B、TP4×DP2×PP2、Bidirectional：
+
+| GA | contiguous | cyclic |
+|---:|---:|---:|
+| 2 | **15.55%** | **4.12%** |
+| 4 | **7.84%** | **2.03%** |
+| 8 | **4.96%** | **1.29%** |
+
+收益随GA增加下降，但6个参数点全部为正。解释是GA较小时固定DP/副本同步尾部占iteration比例更高，优先调度更容易缩短端到端尾部；GA增加后大量正常F/B计算稀释了同步收益。
+
+### 5. DP=4与LLM replica特征
+
+GPT-13B、GA=4、TP4×DP4×PP2在Hermod 32-GPU topology上有1,088条DP flow。Dynamic-tail结果：
+
+| placement | Default | Dynamic | improvement |
+|---|---:|---:|---:|
+| contiguous | 8,268,837 | 7,712,679 | **6.73%** |
+| cyclic | 15,295,405 | 13,874,545 | **9.29%** |
+
+逐特征executor消融：
+
+- dimension tie：与Dynamic完全相同；
+- chunk tie：与Dynamic相同，cyclic只改变少量事件而不改变makespan；
+- replica tie：contiguous得到7,566,512，相对Default改善**8.49%**，比Dynamic再缩短146,167 us；
+- replica tie：cyclic得到13,894,348，比Dynamic慢19,803 us。
+
+物理映射解释为：
+
+```text
+contiguous replica server order:
+  stage0 [0,0,1,1], stage1 [2,2,3,3]  -> monotone
+
+cyclic replica server order:
+  stage0 [0,1,2,3], stage1 [1,2,3,0]  -> non-monotone
+```
+
+单纯加入route hop、resource width或residual load不能消除cyclic退化，因为发生分歧的对称replica在这些字段上仍相同。
+
+因此实现了`guarded_replica_tie`：只有所有PP stage的DP replica server序列都单调时启用replica tie，否则自动退化为Dynamic-tail。验证结果：
+
+| placement | Dynamic | raw replica | guarded replica |
+|---|---:|---:|---:|
+| contiguous | 7,712,679 | **7,566,512** | **7,566,512** |
+| cyclic | **13,874,545** | 13,894,348 | **13,874,545** |
+
+这是目前第一个在真实AICB、真实route和max-min executor中观察到独立收益的LLM-specific特征。但guard只验证一个模型/DP=4/拓扑组合，应表述为restricted placement rule，而不是通用最优规则。
+
+### 6. Profile误差
+
+只扰动调度器估计，executor继续使用原始AICB真实duration。
+
+整类compute或communication统一缩放到80%/120%时，Dynamic-tail的动作和makespan完全不变。进一步对每个task使用3个独立固定seed的±20%乘性噪声：
+
+| placement | nominal Dynamic improvement | noisy improvements |
+|---|---:|---:|
+| contiguous | 6.73% | 8.08%, 8.09%, 8.17% |
+| cyclic | 9.29% | 9.23%, 9.27%, 9.55% |
+
+端到端收益没有被噪声破坏，但控制开销明显恶化：nominal allocation calls约1,012/1,392、allocator时间约0.68/0.87秒；噪声后变成5,500--6,812次和4.4--5.2秒。原因是近似相同的tail被噪声拆成大量唯一tier，产生更多暂停和重分配事件。
+
+尝试1 ms固定tail bucket没有降开销；100 ms bucket虽在部分噪声场景减少calls，却明显损害makespan：nominal contiguous收益从6.73%降到2.84%，cyclic从9.29%降到4.21%。固定分桶方案应否定。下一步更合理的是只在真实冲突集合变化时重算，或给priority变化设置hysteresis/minimum residency，而不是粗化tail本身。
+
+### 7. 开销
+
+DP=2的GPT-13B/22B中，Dynamic allocator平均每次调用约0.23--0.28 ms；DP=4 nominal约0.62--0.74 ms。Guarded replica在contiguous中因改变事件轨迹产生2,615次调用，总allocator时间约2.14秒，平均0.82 ms；cyclic退化为Dynamic后1,392次、约1.08秒，平均0.78 ms。
+
+这是Python离线executor wall-clock，不等于真实训练控制面开销，但已经达到“单事件亚毫秒量级”的原型目标。需要继续降低调用次数，而不是进一步复杂化每次评分。
+
+### 8. 当前结论
+
+1. 真实AICB的DP覆盖、两种PP策略、两种拓扑规模和真实max-min allocator已经闭环；
+2. Strict Dynamic-tail对Bidirectional在多模型、多GA、DP=2/4和两种placement下稳定优于Default fair-share；
+3. 1F1B没有可测收益，因此尚未满足“至少两种PP策略稳定提升”的原退出条件；
+4. Resource-tail在所有正式场景中都没有独立收益，暂不应增加在线复杂度；
+5. Replica wavefront在DP=4 contiguous中有独立收益，placement monotonic guard能保留正例并规避已知cyclic反例；
+6. Profile噪声没有消除makespan收益，却显著增加重分配开销；固定tail bucket不是解决办法；
+7. 当前最值得继续的方向是Bidirectional专用的Dynamic-tail + guarded replica，并加入冲突触发和priority hysteresis；不是继续添加bonus。
+
+### 9. 产物
+
+- 真实executor研究policy、DP覆盖、strict progressive filling、guard和profile扰动：`scripts/study_real_aicb_executor_heuristics.py`
+- allocator定向测试：`tests/test_study_real_aicb_executor_heuristics.py`
+- DP=2跨模型Bidirectional：`outputs/real_aicb_executor_heuristics/gpt13b_22b_bidirectional_matrix.json`
+- DP=2跨模型1F1B：`outputs/real_aicb_executor_heuristics/gpt13b_22b_1f1b_matrix.json`
+- GA扫描：`outputs/real_aicb_executor_heuristics/gpt13b_bidirectional_ga_matrix.json`
+- DP=4特征消融：`outputs/real_aicb_executor_heuristics/gpt13b_bidirectional_dp4_ablation.json`
+- placement guard：`outputs/real_aicb_executor_heuristics/gpt13b_bidirectional_dp4_guarded.json`
+- profile噪声：`outputs/real_aicb_executor_heuristics/gpt13b_bidirectional_dp4_profile_noise.json`
+- 分桶负结果：`outputs/real_aicb_executor_heuristics/gpt13b_bidirectional_dp4_bucket100ms.json`
+
+本阶段仍未修改通用Task/schema/executor、默认policy注册或baseline runner。
+
+本阶段定向回归为`21 passed`。最新完整测试集为`845 passed, 3 skipped, 18 errors`；18个error仍全部来自缺失的外部`Spectrum-X_8g_8gps_400Gbps_H100` fixture，与本阶段无关。只读syntax检查和`git diff --check`通过。
