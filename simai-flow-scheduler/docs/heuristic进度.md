@@ -2368,3 +2368,1289 @@ DP=2的GPT-13B/22B中，Dynamic allocator平均每次调用约0.23--0.28 ms；DP
 本阶段仍未修改通用Task/schema/executor、默认policy注册或baseline runner。
 
 本阶段定向回归为`21 passed`。最新完整测试集为`845 passed, 3 skipped, 18 errors`；18个error仍全部来自缺失的外部`Spectrum-X_8g_8gps_400Gbps_H100` fixture，与本阶段无关。只读syntax检查和`git diff --check`通过。
+
+---
+
+## 修订阶段 R0：模型规范与语义回归（2026-08-09）
+
+### 1. 本阶段目的
+
+此前的 exact DP、rollout、Beam、多资源 Oracle 和真实 executor 实验允许通信在 tick/event 边界切换，部分路径还使用 max-min 带宽共享。用户进一步明确目标问题后，最终语义改为：
+
+1. 通信和计算节点一旦开始，就必须连续执行到完成；
+2. 单 channel 上采用极化分配，一次把全部带宽交给一条通信；
+3. 调度器研究的是完整 flow 的开始顺序，不研究时间片或带宽比例；
+4. channel 空闲时，即使已有 ready flow，也允许主动等待将来的 compute completion/release；
+5. 节点完成后可以重新规划尚未开始的任务，但不能改变正在运行的节点。
+
+因此 R0 不做算法优劣比较，先建立所有后续 Oracle 和 heuristic 必须共同遵守的语义基线。
+
+### 2. 隔离实现
+
+新增 `scripts/nonpreemptive_dag_model.py`，复用阶段 1 的只读 `BenchmarkDAG`/`BenchTask`，但没有复用旧 `_tick` 或可抢占 Oracle，也没有修改通用 `Task`、schema、executor 和 baseline policy。
+
+状态对每个节点显式记录：
+
+- `pending`：尚未开始；
+- `running`：已经开始，并记录剩余时间与开始时刻；
+- `completed`：已经完成，并记录开始/结束时刻；
+- 当前绝对时间；
+- channel 上的 active flow。
+
+调度器只观察 channel 空闲的稳定决策状态。合法动作只有：
+
+- `FLOW(i)`：若 flow `i` 已 ready，则从当前时刻开始，用完整 channel 连续运行到完成；
+- `WAIT`：若至少有一个 active compute，则推进到最近的 compute completion。
+
+`FLOW(i)` 的内部仍逐 compute-completion 处理依赖释放。例如长 flow 运行期间可以有 compute 完成，并使另一条 flow 变为 ready；但这个中间事件只更新状态，不开放调度决策，新 flow 必须等当前 flow 完成。这样既保留了精确的 DAG 因果关系，也不会偷偷恢复通信抢占。
+
+所有无依赖或刚被解锁的 compute 都会立即启动；它们互相并行，也可以和通信重叠。compute 只减少 remaining time，不存在暂停动作。`WAIT` 只到下一个真实完成事件；没有 active compute 时不枚举 WAIT，避免无限原地等待。
+
+时间线为每个已完成节点保存唯一的 `[start,end)` 区间。`assert_nonpreemptive_trace` 会检查：
+
+- 区间长度严格为正；
+- 同一个节点不能有两个区间；
+- 每个 completed 节点必须恰有一个区间；
+- 区间端点必须与 runtime 的 started/completed 时刻一致。
+
+### 3. 三类手算 DAG
+
+#### 3.1 长 flow 内发生新释放
+
+```text
+release: compute(2) ──> new_flow: comm(1) ──> compute_tail(3)
+
+long_flow: comm(5)，t=0 ready
+```
+
+在 `t=0` 启动 `long_flow` 后，`release` 在 `t=2` 完成，`new_flow` 随即 ready；但 `long_flow` 仍连续占用 channel 到 `t=5`。随后 `new_flow` 在 `[5,6)` 运行，尾部 compute 在 `[6,9)` 运行，makespan 为 `9`。这同时验证：flow 不可抢占、compute/communication 可重叠、compute 完成可在 flow 内释放新任务、新任务等待 active flow 完成。
+
+#### 3.2 连续主动等待
+
+```text
+release_1: compute(1) ──> flow_1: comm(1)
+release_2: compute(3) ──> flow_2: comm(1)
+ready_now: comm(4)，t=0 ready
+```
+
+调度器可在已有 `ready_now` 时先 WAIT：第一次从 `t=0` 等到 `t=1`，第二次仍在有 ready flow 时从 `t=1` 等到 `t=3`。两个 compute 都完成后不再存在未来 release，因此 WAIT 从合法动作集合消失。再按 `flow_1、flow_2、ready_now` 执行，makespan 为 `9`。这验证连续 WAIT 能跨多个 release，且不会生成无意义 WAIT。
+
+#### 3.3 主动等待严格必要
+
+取规划中的永久反例，令 `M=10`：
+
+```text
+A: comm(10)，t=0 ready，无后继
+release_B: compute(1) ──> B: comm(1) ──> tail_B: compute(10)
+```
+
+Work-conserving 调度在 `t=0` 只能启动 A：
+
+```text
+A [0,10) -> B [10,11) -> tail_B [11,21)，makespan = 21
+```
+
+允许主动等待时：
+
+```text
+WAIT [0,1) -> B [1,2)
+                 ├─ tail_B [2,12)
+                 └─ A      [2,12)
+makespan = 12
+```
+
+结果精确符合 `T_WC=2M+1=21`、`OPT=M+2=12`。随着 `M` 增大，两者比值趋近 `2`。这个差距不是 flow 排序 tie-break 造成的，而是“是否允许暂时不启动当前唯一 ready flow”造成的；因此 WAIT 必须进入后续精确 Oracle 的动作空间。
+
+### 4. 语义回归覆盖
+
+新增 `tests/test_nonpreemptive_dag_model.py`，共 6 个测试，覆盖：
+
+1. active flow 不会被中途释放的 flow 抢占；
+2. compute 一旦启动连续运行，并可与通信重叠；
+3. 有 active compute 时可主动 WAIT，且允许连续 WAIT；
+4. 没有未来 compute event 时 WAIT 非法；
+5. 主动等待反例的 `21` 与 `12` 两条完整时间线；
+6. task ID、依赖和 DAG 无环性不被运行过程修改，并拒绝有环或零时长输入。
+
+R0 测试与旧阶段 1 benchmark/oracle 回归一起运行，结果为：
+
+```text
+11 passed
+```
+
+`git diff --check` 和人工 100 字符行宽检查通过。环境没有安装 `ruff`，因此 `python -m ruff check` 未执行；pytest 已成功导入并执行新增模块。一次额外 `py_compile` 因沙箱不允许写已有 `scripts/__pycache__` 而退出，这不影响上述测试结果。
+
+完整 `pytest tests -q` 结果为 `851 passed, 3 skipped, 18 errors`。18 个 error 全部来自缺失的仓库外 `Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与 R0 修改无关；相较此前完整回归，新增的 6 个 R0 测试全部进入 passed 计数。
+
+### 5. 当前结论与边界
+
+R0 的退出条件已经满足：三个手算 DAG 的动作、事件、时间线和 makespan 已逐项核对；已完成节点均只有一个连续区间；主动等待和无意义等待的边界已经固定为回归测试。
+
+但本阶段只是语义闭环，不是优化算法闭环。当前模块还没有搜索最优动作序列，也没有给 Dynamic-tail、rollout 或 Beam 产生新模型下的正式结果。旧的 preemptive/tick-level 数字仍保留为历史记录，但从本节开始不得再把它们当作目标模型的性能结论。下一阶段 R1 应在这个状态机上实现并交叉验证：
+
+- 允许 WAIT 的 `OPT_optional_idle`；
+- 有 ready flow 时禁止 WAIT 的 `OPT_work_conserving`；
+- 最优动作和连续时间线重建；
+- ordering regret 与 idle regret 的分离。
+
+---
+
+## 修订阶段 R1：Non-preemptive + Optional-idle Exact Oracle（2026-08-09）
+
+### 1. 目标与产物
+
+R1 在 R0 的不可抢占状态机上实现两种最优值：
+
+- `OPT_optional_idle`：ready flow 存在时仍允许 `WAIT`；
+- `OPT_work_conserving`：只在没有 ready flow 时允许 forced WAIT。
+
+新增：
+
+- `scripts/nonpreemptive_dag_oracle.py`：memoized residual-cost DP、独立 forward branch-and-bound、lower bound、动作重放与等待分类；
+- `scripts/study_nonpreemptive_oracle.py`：固定种子正式矩阵与 JSON 报告；
+- `tests/test_nonpreemptive_dag_oracle.py`：两套 Oracle、主动等待反例、catalog、随机 fork/join、remaining-time key 和 hard limit 回归；
+- `tests/test_study_nonpreemptive_oracle.py`：正式 runner 的小矩阵 smoke test；
+- `outputs/nonpreemptive_oracle/r1_summary.json`：175 个正式小图的完整动作、下界、状态数和运行时间。
+
+仍未修改通用 `Task`、schema、executor、bandwidth allocator 或 baseline policy。
+
+### 2. 精确状态与动作
+
+Oracle 的 memoization key 是：
+
+$$
+K(s)=\big((status_v,remaining_v)\big)_{v\in V}.
+$$
+
+其中 pending/completed 节点的 remaining 为 0，running compute 必须保留真实 remaining。绝对时刻、历史 started/completed timestamp 不影响未来 residual cost，因此不进入 key；最优动作求出后，再从真实 `t=0` 状态用 R0 状态机重放，恢复绝对时间线。
+
+这个 key 不能简化成“已完成 flow 集合”或“通信顺序前缀”。例如同一批 flow 完成后，一个 active compute 还剩 1 单位和还剩 5 单位，会改变下一次 release、WAIT 长度和最优选择，必须是不同状态。
+
+在一个稳定决策状态上：
+
+$$
+F(s)=\min_{a\in A(s)}\{\Delta(s,a)+F(T(s,a))\}.
+$$
+
+- `FLOW(i)` 的 $\Delta=p_i$，直接运行完整 flow；
+- `WAIT` 的 $\Delta$ 是最近 active compute completion 的 remaining；
+- optional-idle 的 $A(s)$ 包含 ready flows 和合法 WAIT；
+- work-conserving 在 ready set 非空时从 $A(s)$ 删除 WAIT。
+
+如果两个动作产生完全相同的 successor key，只保留一个。这是按精确后继状态做的安全合并，不依赖不可靠的 role、microbatch 或 chain 标签。
+
+### 3. 两套相互校验的搜索
+
+#### 3.1 Memoized residual-cost DP
+
+DP 对每个 key 缓存精确的 residual makespan 和完整动作后缀。每个状态先用 FIFO、Longest-tail 以及 optional-idle 下的 wait-first 变体构造可行后缀上界 $U(s)$，然后只剪掉满足：
+
+$$
+\Delta(s,a)+LB(T(s,a))\ge U(s)
+$$
+
+的动作。因为 $U(s)$ 是真实可行调度，$LB$ 是必要下界，被剪动作不可能产生更小结果；这个剪枝是局部于当前 residual state 的，不使用可能污染缓存值的全局 cutoff。
+
+#### 3.2 独立 forward branch-and-bound
+
+第二套 Oracle 从初始状态向前 DFS，维护完整可行 incumbent，并使用：
+
+- elapsed + residual lower bound 剪枝；
+- 同一 residual key 的更早 elapsed 支配更晚 elapsed；
+- lower-bound-first 动作顺序；
+- 独立重建的 incumbent action path。
+
+两套搜索共用经过 R0 测试的语义 transition，但递推方向、缓存内容和剪枝结构不同。每个正式实例的两种 idle mode 都要求两者 makespan 完全一致，否则 runner 立即失败。
+
+### 4. Lower bound
+
+保留旧的合法松弛：
+
+$$
+LB_0=\max(P,Q,L,LB_{window},LB_{cut}).
+$$
+
+新增 non-preemptive release/tail subset bound。为避免把通信工作重复计数，release 和 tail 只累计 compute duration。对任意 release threshold $r$ 和 compute-tail threshold $q$，令：
+
+$$
+S(r,q)=\{i:r_i^{comp}\ge r,\ q_i^{comp}\ge q\},
+$$
+
+则：
+
+$$
+LB_{rt}(r,q)=r+\sum_{i\in S(r,q)}p_i+q.
+$$
+
+理由是集合中的所有通信都不早于 $r$ 可用，必须在单 channel 上串行；其中最后完成的通信至少还有 $q$ 的纯计算后继。枚举实际出现的 $r,q$ threshold 即可。还记录初始状态在“没有 ready flow”时到下一 compute event 的 forced-wait bound。最终取所有下界最大值。
+
+在本批 175 图中：
+
+- combined lower bound 在 153 图上直接等于 `OPT_optional_idle`；
+- 平均 `OPT/LB=1.00918`，观察到的最大值为 `1.25`；
+- 新 `release_tail` 没有在现有样本上超过旧 combined bound。
+
+因此新增下界是安全的 non-preemptive 剪枝部件，但当前没有证据表明它比旧 window/critical-path bound 更有判别力。
+
+### 5. R0 的零时长 compute 兼容修正
+
+旧链 benchmark 用 `compute(0)` 表示两段通信之间没有 delay。R0 初版错误地把所有零时长节点都拒绝，导致无法重跑原反例。现已明确：
+
+- flow duration 必须严格为正；
+- compute duration 可以为 0，并在被解锁的同一时刻 start/complete；
+- 零时长 compute 用退化区间 `[t,t)` 记录；
+- communication 仍绝不允许零时长或多个执行区间。
+
+对应语义回归已加入 R0 测试。这只是兼容 benchmark 的瞬时闭包，不引入可抢占。
+
+### 6. 正式 benchmark 配置
+
+命令：
+
+```bash
+python scripts/study_nonpreemptive_oracle.py
+```
+
+共 175 个图，每个图求 optional-idle/work-conserving 两种模式，并分别由 DP/B&B 求解，即 700 次 exact solve：
+
+| category | 数量 | 配置 |
+|---|---:|---|
+| adversarial | 10 | 主动等待 tight-2、原 tail/5/4 构造、阶段 1 七类对抗图 |
+| LLM motif | 7 | PP wave、1F1B、ZB fork、W/DP optimizer、TP+PP 等 |
+| random chain | 100 | seed `260813`，2--5 chains，每链 1--3 flows |
+| random general | 50 | seed `260817`，fork/join、第二段 flow、nested/optimizer join |
+| real reduction | 8 | 真实 1F1B effective DAG 的 8 个时间桶，原始微秒 duration |
+
+真实窗口显式使用 `real_max_flows=1`。这不是说窗口最终只有一条 flow：join companion closure 后最多达到 13 条 flow、32 个节点。`bucket_rank=6` 在 `max_flows=4` 时会膨胀到 48 条 flow，optional-idle DP 超过 30 秒，不再属于本阶段 exact 小窗口；因此没有把它的非精确结果混入报告。参数仍可在 runner 中调整。
+
+### 7. 主要结果
+
+所有 175 个正式图上：
+
+```text
+DP OPT_optional_idle == B&B OPT_optional_idle
+DP OPT_work_conserving == B&B OPT_work_conserving
+```
+
+每个解重放后都自动验证：DAG 完成、所有 flow 只有一个连续区间、不同 flow 的 channel 区间不重叠。
+
+主动等待在 10/175 个图中严格改善：
+
+| category | 改善数/总数 | 最大绝对 idle regret |
+|---|---:|---:|
+| adversarial | 1/10 | 9 |
+| LLM motif | 0/7 | 0 |
+| random chain | 7/100 | 3 |
+| random general | 2/50 | 3 |
+| real reduction | 0/8 | 0 |
+
+这说明主动等待不是只存在于手工极端反例：固定种子随机链中有 7%，随机一般 DAG 中有 4% 会受益；但在当前简单 LLM motif 和真实小窗口中尚未观察到收益，不能据此宣称真实完整 LLM DAG 一定需要等待。
+
+10 个 idle-hard 实例为：
+
+```text
+optional_wait_tight_two: 12 vs 21
+random_chain_14: 21 vs 22
+random_chain_52: 20 vs 21
+random_chain_60: 15 vs 16
+random_chain_70: 18 vs 19
+random_chain_77: 26 vs 29
+random_chain_86: 24 vs 25
+random_chain_98: 17 vs 18
+random_join_23: 17 vs 20
+random_join_46: 22 vs 23
+```
+
+这里前一个数是 `OPT_optional_idle`，后一个数是 `OPT_work_conserving`。每个最优解都只使用 1 次 voluntary WAIT；其主动等待时长分别为 `1,1,3,1,1,1,1,2,1,1`。总 WAIT time 还可能包含之后没有 ready flow 时不可避免的 forced wait，因此报告将两者分开。
+
+几个既有反例的新模型最优值：
+
+| instance | optional idle | work-conserving | combined LB |
+|---|---:|---:|---:|
+| motivating/`longest_tail_counterexample` | 8 | 8 | 8 |
+| scaled tail，scale=4 | 32 | 32 | 32 |
+| scaled 5/4，scale=4 | 33 | 33 | 32 |
+| `random_join_30` | 22 | 22 | 22 |
+| `random_join_40` | 21 | 21 | 21 |
+
+因此 `random_join_30/40` 的旧最优值恰好保持，但这是新 Oracle 重新求出的结果，不是沿用旧 tick Oracle。它们属于 ordering-hard，不属于 idle-hard。相反，`random_join_23` 在旧可抢占模型中没有暴露差距，在新模型中等待 `t=1` 即将释放的短关键 flow 可把 makespan 从 20 降到 17，是 non-preemption 与 optional idle 共同产生的新反例。
+
+### 8. 搜索规模与适用边界
+
+optional-idle 比 work-conserving 多一个 WAIT 分支，明显更贵：
+
+| mode | DP mean | DP max | B&B mean | B&B max |
+|---|---:|---:|---:|---:|
+| optional idle | 781.62 ms | 21,576.69 ms | 141.63 ms | 4,024.21 ms |
+| work-conserving | 202.82 ms | 5,684.87 ms | 63.36 ms | 1,653.33 ms |
+
+最难的 `random_chain_88` 有 12 条 flow：optional-idle DP 探索 5,168 个 residual states，用时约 21.6 秒；B&B 探索 13,322 次 DFS visit，用时约 4.0 秒。状态数不能直接横比，因为 DP state 只计 cache miss，而 B&B visit 包含被剪分支。
+
+这套 Oracle 适合作为 R2/R3 的小图 teacher、反例验证器和 optimality label 生成器，不适合作为在线 scheduler。默认 hard limit 为每次 `2,000,000` states、30 秒；超限会显式抛错，不会返回伪装成最优的 incumbent。
+
+### 9. Regret 分解与结论
+
+对 work-conserving heuristic $H$：
+
+$$
+T_H-OPT_{idle}
+=
+\underbrace{T_H-OPT_{wc}}_{ordering\ regret}
++
+\underbrace{OPT_{wc}-OPT_{idle}}_{idle\ regret}.
+$$
+
+R1 已经能给两项分别打 exact label。后续 R2 不应再把所有失败都解释成“tail 排序错误”：
+
+- `random_join_30/40` 应用于研究 ready-flow ordering；
+- `optional_wait_tight_two`、`random_join_23/46` 和 7 个随机链应用于研究 WAIT 判定；
+- 两类 hard set 应分别报告，再增加同时含两种损失的 combined-hard set。
+
+R1 退出条件已经满足：两套独立搜索在全部正式小图、两种 idle 模式上给出相同最优值；每条最优时间线均通过不可抢占连续区间验证。下一阶段 R2 可以开始把 FIFO/SPT/LPT/Longest-delay/Dynamic-tail 等全部改为 whole-flow 版本，并以本 Oracle 重新测经验最优率、近似比反例和 WAIT-aware rollout。
+
+最终定向回归为 `19 passed`。完整 `pytest tests -q` 为 `859 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的仓库外 `Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与 R1 无关。`git diff --check` 和人工 100 字符 Python 行宽检查通过；当前环境仍未安装 `ruff`。
+
+---
+
+## 修订阶段 R2：并行链算法与理论（2026-08-09）
+
+### 1. 新的 operation-level 并行链模型
+
+新增 `scripts/study_nonpreemptive_parallel_chains.py`。旧 `study_parallel_chains.py` 继续保留为 legacy tick/preemptive 实验，不在原文件上修改语义，以免历史结果和新模型混淆。
+
+第 $k$ 条链表示为：
+
+$$
+(r_k; p_{k,1},q_{k,1},p_{k,2},q_{k,2},\ldots,p_{k,m_k},q_{k,m_k}),
+$$
+
+其中 $r_k$ 是第一条 flow 前的 initial compute/release delay，$p$ 是不可抢占通信时长，$q$ 是通信后的 compute delay。旧 `Chain(comm,delay)` 等价于 $r_k=0$。
+
+紧凑状态只记录：
+
+$$
+s_k=(j_k,c_k),
+$$
+
+即下一条尚未开始的通信位置 $j_k$ 和当前 compute cooldown $c_k$。不再记录“通信 remaining”，因为 flow 不允许执行一半后留在状态里。
+
+- `FLOW(k)`：运行完整 $p_{k,j_k}$；期间所有 active cooldown 同步减少，但新释放 flow 不能抢占；结束时该链进入 $q_{k,j_k}$；
+- `WAIT`：推进 $\min_{k:c_k>0}c_k$，至少完成一个 compute；
+- work-conserving 模式仅在 ready set 为空时 WAIT；
+- optional-idle 模式在有 active compute 时始终允许 WAIT。
+
+每种 heuristic 的完整动作序列都会转换回 `BenchmarkDAG`，交给 R0 状态机重新执行，并验证 makespan 相同、DAG 完成、每个 flow 只有一个连续区间、channel 上 flow 区间不重叠。正式实验中所有算法的 `preemptions=0`。
+
+### 2. 实现的方法是什么
+
+#### 2.1 Whole-flow priority baseline
+
+- **FIFO**：选择编号最小的 ready chain，作为固定到达顺序基线；
+- **SPT**：选择当前完整 flow 最短者，希望尽快释放下一批任务；
+- **LPT**：选择当前完整 flow 最长者，优先消化大通信；
+- **Longest-delay**：只看当前 flow 紧随的下一段 compute，优先释放最长的下一段计算；
+- **Dynamic-tail**：计算该 ready flow 完成后的整条 residual chain tail，即后续所有 compute 和 future communication 的总长度，选择 tail 最大者；
+- **LRPT**：在 Dynamic-tail 上再加当前 flow 时长，优先 residual processing time 最大者；
+- **Earliest-slack**：在独立链 makespan 模型中与 LRPT 排序代数等价，作为命名对照保留；
+- **TicTac-style pairwise**：对候选 A/B 比较“A 完整执行后再 B”和“B 后再 A”对两条 residual tail 的局部影响，以锦标赛方式选出一个 flow。
+
+这些 baseline 都是 idle-unaware/work-conserving：有 ready flow 就必须开始一条完整 flow。
+
+#### 2.2 Full-flow rollout
+
+以 Dynamic-tail 为 base policy。对 top-2 ready flow 分别评估：
+
+$$
+\widehat C(a|s)=\Delta(s,a)+J_{DT}(T(s,a)),
+$$
+
+其中 $J_{DT}$ 是从 successor 开始用 whole-flow Dynamic-tail 补全到结束的真实模拟 makespan。
+
+- **Rollout-flow-2**：只比较完整 flow；
+- **Rollout-WAIT-2**：在有 active compute 时额外比较 WAIT 到下一 completion。
+
+base action 无条件进入候选。因此即使 top-2 截断或增强搜索超时，也可以回退到 Dynamic-tail。默认 wall-clock budget 为 2 秒；超时后剩余调度直接使用 base policy，并记录 fallback。
+
+#### 2.3 Beam 与 Monte Carlo
+
+- **Beam-8/32**：一层扩展一个完整 FLOW 或一次 WAIT；按 elapsed + residual LB 和 Dynamic-tail completion estimate 排序，只保留 8/32 个状态；始终保留完整 Dynamic-tail incumbent；默认 `100,000` state、2 秒 budget；
+- **MC-64**：采样 64 条完整 operation-level action path。70% 概率从 Dynamic-tail top-2 中随机，15% 概率在 WAIT 合法时尝试等待；最终与 Dynamic-tail incumbent 取最好值。
+
+Beam/MC 是有明确预算的非多项式增强，不是 exact solver。固定 Beam 反例见后文。
+
+#### 2.4 Exact DP 与二分 feasibility
+
+直接 DP 的递推为：
+
+$$
+F(s)=\min_{a\in A(s)}\{\Delta(s,a)+F(T(s,a))\}.
+$$
+
+它分别求 `OPT_optional_idle` 和 `OPT_work_conserving`。相同 `ParallelChain` 的状态在组内排序 canonicalize，因此只合并真正相同链的置换。
+
+二分法在 $[LB,U]$ 上搜索 horizon $H$，feasibility DP 使用：
+
+$$
+\operatorname{Feasible}(s,B)
+=\bigvee_{a:\Delta_a\le B}
+\operatorname{Feasible}(T(s,a),B-\Delta_a),
+$$
+
+若 residual `max(P,Q,L)>B` 立即返回 false。这里 WAIT 是正式 action，不再像旧二分 DP 那样只有 forced tick idle。
+
+这两种 DP 对数值 duration 是伪多项式/状态空间指数型 teacher，不是在线算法。默认 hard limit 是 200 万 states、30 秒。
+
+### 3. 与 R1 Oracle 的交叉验证
+
+新增 `tests/test_study_nonpreemptive_parallel_chains.py`。其中 12 个固定随机实例被转换成一般 `BenchmarkDAG`，compact DP 与 R1 Oracle 在两种 idle mode 下全部一致；另有 8 个实例的 operation-level binary feasibility 与 direct DP 一致。
+
+正式 100 图中，前 40 图再次运行两种 mode 的 binary feasibility：全部与 direct DP 一致。optional-idle direct DP 平均 1,891.8 states、46.21 ms，p95 为 8,696 states；work-conserving DP 平均 665.06 states、11.82 ms。前 40 图的 optional binary 平均 471.03 states、11.64 ms。这个样本上二分更省，但它并不改变 worst-case 指数状态数。
+
+### 4. 正式随机实验
+
+配置与旧阶段保持相同以便对照：100 个固定 seed `260813` 实例，2--5 条链，每链 1--3 个 flow，communication 1--4，compute delay 0--6。所有比值分母是新的 `OPT_optional_idle`。
+
+| method | exact optimal | mean ratio | p95 | observed max | mean runtime |
+|---|---:|---:|---:|---:|---:|
+| FIFO | 14/100 | 1.15997 | 1.3750 | 1.5000 | 0.21 ms |
+| SPT | 24/100 | 1.13358 | 1.4000 | 1.4783 | 0.21 ms |
+| LPT | 8/100 | 1.16787 | 1.3684 | 1.5385 | 0.18 ms |
+| Longest-delay | 30/100 | 1.08975 | 1.2500 | 1.3333 | 0.18 ms |
+| Dynamic-tail | 83/100 | 1.01444 | 1.1111 | 1.1875 | 0.19 ms |
+| LRPT / Earliest-slack | 58/100 | 1.03041 | 1.1429 | 1.1875 | 0.20 ms |
+| TicTac-style | 83/100 | 1.01444 | 1.1111 | 1.1875 | 0.17 ms |
+| Rollout-flow-2 | 91/100 | 1.00525 | 1.0476 | 1.1154 | 1.74 ms |
+| Rollout-WAIT-2 | **95/100** | **1.00234** | **1.0000** | **1.0556** | 2.54 ms |
+| Beam-8 | 100/100 | 1.00000 | 1.0000 | 1.0000 | 7.05 ms |
+| Beam-32 | 100/100 | 1.00000 | 1.0000 | 1.0000 | 15.38 ms |
+| MC-64 | 91/100 | 1.00587 | 1.0476 | 1.1154 | 17.14 ms |
+
+正式结果与 R2 先验审计的核心数字一致：Dynamic-tail 仍为 83/100，idle-hard 仍为 7/100。正式 rollout 略好于临时原型的 89/92，得到 91/95；原因是正式版统一使用完整 flow transition、相同 whole-flow Dynamic-tail 补全、base-action incumbent 和稳定 tie-break。应以本节结果为准。
+
+所有方法 fallback 均为 0。Beam-32 在这组很小的 frontier 上没有比 Beam-8 增加命中率，却把平均时间从 7.05 ms 增到 15.38 ms；MC-64 更慢且只达到 rollout-flow-2 的命中数，当前没有作为默认方法的价值。
+
+TicTac-style 在这 100 图上与 Dynamic-tail 的 makespan 指标完全相同。这不证明 comparator 等价，只说明当前短链/小 duration 分布没有产生可见增益。
+
+### 5. WAIT 消融和 hard set
+
+三类困难实例数量为：
+
+```text
+idle-hard:             OPT_wc > OPT_idle                 7/100
+ordering-hard:         Dynamic-tail > OPT_wc            13/100
+combined-hard:         两种差距同时存在                  3/100
+```
+
+Dynamic-tail 在 87/100 图上达到 `OPT_wc`，但因为其中部分 `OPT_wc>OPT_idle`，最终只在 83/100 图上达到真正目标最优。
+
+Rollout-flow-2 在 98/100 图上达到 `OPT_wc`，说明 full-flow counterfactual 几乎消除了 ready-flow ordering error；但它不能主动等待，所以最终只有 91/100 达到 `OPT_idle`。
+
+加入 WAIT 后，Rollout-WAIT-2 在 4 个实例上严格改善 flow-only，0 个变差：
+
+```text
+sample 52: 21 -> 20 = OPT_idle
+sample 60: 16 -> 15 = OPT_idle
+sample 77: 29 -> 26 = OPT_idle
+sample 98: 18 -> 17 = OPT_idle
+```
+
+另外 3 个 idle-hard 实例 `14/70/86` 没被一步 WAIT rollout 修复；它们同时属于 combined-hard，必须先修 ordering 或需要更深的 wait/order 联合 lookahead。WAIT 不是“加入候选就自动最优”，但消融已经证明它有独立实际作用。
+
+### 6. 不可抢占 work-conserving 的紧 2-approximation
+
+令总通信量：
+
+$$
+P=\sum_{k,j}p_{k,j},
+$$
+
+令单条链上的最大总计算量（含 initial release）：
+
+$$
+Q=\max_k\left(r_k+\sum_jq_{k,j}\right).
+$$
+
+对任意 work-conserving whole-flow 调度 $H$，channel busy time 恰为 $P$，记总 forced idle 为 $I_H$，则：
+
+$$
+T_H=P+I_H.
+$$
+
+取在 $T_H$ 时最后完成的链 $k^*$。在任意 channel idle 区间中，$k^*$ 尚未完成；如果它有 ready flow，work-conserving 规则就不允许 channel idle，因此它此时必在执行自己的 compute。链内 compute 不重叠，所以所有 channel idle 都可注入式地收费到 $k^*$ 的 compute 区间：
+
+$$
+I_H\le r_{k^*}+\sum_jq_{k^*,j}\le Q.
+$$
+
+另一方面，任何允许主动等待的最优解也必须在单 channel 上完成全部通信，并在每条链上经历其计算，所以：
+
+$$
+OPT_{idle}\ge P,\qquad OPT_{idle}\ge Q.
+$$
+
+因此：
+
+$$
+T_H\le P+Q\le2\max(P,Q)\le2OPT_{idle}.
+$$
+
+这个证明不要求通信可抢占，也不要求某种 priority；FIFO、SPT、LPT、Dynamic-tail、flow-only rollout 等任意 work-conserving whole-flow 顺序都成立。
+
+### 7. 为什么 2 是 tight
+
+构造两条链：
+
+```text
+A: comm(M) -> compute(0)，t=0 ready
+B: initial compute(1) -> comm(1) -> compute(M)
+```
+
+在 `t=0` 只有 A ready，所以任何 work-conserving 算法都必须运行 A：
+
+$$
+T_{wc}=M+1+M=2M+1.
+$$
+
+允许主动等待的最优解为：
+
+```text
+WAIT [0,1) -> B [1,2) -> A [2,M+2)
+                       └─ B compute [2,M+2)
+```
+
+故：
+
+$$
+OPT_{idle}=M+2,
+\qquad
+\frac{T_{wc}}{OPT_{idle}}=\frac{2M+1}{M+2}\to2.
+$$
+
+因此 2 不只是当前证明松，而是所有 work-conserving 算法相对 optional-idle OPT 的紧界。Dynamic-tail 作为其中之一也有 tight 2；继续尝试证明普通 Dynamic-tail 严格小于 2 已经没有意义。
+
+在这个族上 Rollout-WAIT-2 会比较 `FLOW(A)` 和 `WAIT` 的完整后果，并选择 WAIT，得到 OPT。这说明 WAIT rollout 修复了 tight family，但尚不能推出它在一般实例上有 `<2` 保证。
+
+### 8. Rollout、Beam、MC 的可证明界
+
+令 base Dynamic-tail 的 cost-to-go 为 $J_B(s)$。rollout 的候选始终包含 base action $a_B$，并选择：
+
+$$
+a_R\in\arg\min_{a\in C(s)}\{\Delta_a+J_B(T(s,a))\}.
+$$
+
+因为 $a_B\in C(s)$：
+
+$$
+\Delta_{a_R}+J_B(T(s,a_R))
+\le
+\Delta_{a_B}+J_B(T(s,a_B))
+=J_B(s).
+$$
+
+沿 rollout 轨迹递推/望远镜求和，得到 $J_R(s)\le J_B(s)$。因此 flow-only 和 WAIT-aware rollout 都不差于 Dynamic-tail，并继承 2-approximation 上界。超时后回退 base 也保持该性质。
+
+Beam 和 Monte Carlo 总是把完整 Dynamic-tail schedule 作为 incumbent，所以返回值同样不差于 Dynamic-tail，也继承 2 上界。但“继承 2”不代表存在严格小于 2 的一般界；当前尚无这样的证明。
+
+旧的渐近 5/4 family 在 whole-flow 模型下仍使 Dynamic-tail 得到：
+
+$$
+OPT=8k+1,\qquad T_{DT}=10k,\qquad T_{DT}/OPT\to5/4.
+$$
+
+但新的 full-flow rollout 在所有测试 scale 上直接得到 $8k+1$，所以这个 family 不能再作为 rollout 或 Beam 下界。
+
+固定宽 Beam 也不是 exact。固定 seed `260820` 搜索得到 6-chain 反例，允许 WAIT 的 Beam-8 和
+Beam-32 都返回 47，而 OPT 为 46；该实例已固化为 `fixed_beam_counterexample()` 和永久测试。
+100/100 只能表述为当前分布上的经验命中率。补充实验还表明，不允许 WAIT 的 Beam-32 在这个
+特定反例上能得到 46；不同动作空间会改变启发式剪枝结果，并不存在简单的单调支配关系。
+
+### 9. 复杂性与 restricted results
+
+本模型已经包含经典单机 release-time/tail 问题 $1|r_j,q_j|C_{max}$：对每个 job 建一条只有一次通信的链：
+
+```text
+initial compute(r_j) -> comm(p_j) -> compute(q_j)
+```
+
+两边的可行不可抢占 schedule、主动 idle 和目标值逐一相同，因此这是保持目标值的直接嵌入，不需要借用可抢占或 exact-lag reduction。该单机问题已知强 NP-hard；Hall 与 Shmoys讨论了 Jackson rule、无 precedence 的 PTAS 和有 precedence 的 4/3 approximation：[Jackson's Rule for Single-Machine Scheduling](https://doi.org/10.1287/moor.17.1.22)。Vakhania给出 release-time/tail 模型及 equal processing-time 等特殊多项式情形：[Single-Machine Scheduling with Release Times and Tails](https://doi.org/10.1023/B:ANOR.0000030692.69147.e2)。
+
+可保留的特殊结论：
+
+1. **每链单 flow、全部初始 ready：** 按 compute tail 非增序执行最优。相邻交换中，若 $q_i<q_j$ 却把 $i$ 放在 $j$ 前，交换二者不会增加 $\max(C_i+q_i,C_j+q_j)$；因此 Dynamic-tail exact。20 个随机回归全部验证。
+2. **所有 initial/post compute 都为 0 且初始 ready：** 任意 work-conserving 顺序 makespan 都等于 $P$。
+3. **相同链重复：** 可按 `(next operation,cooldown)` 组内排序，exact canonicalization 不改变最优值。
+4. **有界链数/每链深度/整数 duration：** operation-level DP 可作为伪多项式 exact 方法；复杂度仍随状态组合指数增长。
+5. **单 flow 且 processing time 全相等、允许 release：** 文献给出多项式算法，但这不等于当前 Dynamic-tail 自动最优，也不能直接推广到多 flow chain。
+
+### 10. 一般 fork/join 的界暂不外推
+
+独立链证明用到了“最后完成链在每段 network idle 中都在 compute”这一关键事实。一般 fork/join 中，最后 sink 的不同阻塞阶段可能来自不可比较分支；是否能把所有 idle 区间拼成一条合法 blocking chain，需要重新构造证明。R2 不把上述 $P+Q$ 证明直接宣称为一般 DAG 定理。
+
+R3 应在 effective DAG 上尝试按“最后完成前驱”反向构造 blocking chain，并检查 join 切换是否会重复收费；在证明完成前，一般 DAG 只安全使用 $P+L$ 或可验证的 residual lower bound，不能引用本节独立链的 $P+Q$ charging。
+
+### 11. 当前结论
+
+1. Non-preemptive Dynamic-tail 仍是最有价值的低成本 baseline：约 0.19 ms、83% exact，明显优于只看 size 或下一段 delay；
+2. 它相对 optional-idle OPT 的一般 2 界已经证明且 tight，不能期待普通 work-conserving priority 突破；
+3. Full-flow rollout 主要修 ordering，98/100 达到 `OPT_wc`；
+4. WAIT rollout 有独立价值，把 exact 率从 91% 提到 95%，但仍漏掉 3 个 combined-hard 和 2 个普通 ordering case；
+5. Beam-WAIT-8 在当前 100 图全最优但已有 47/46 反例；Beam-WAIT-32 没提高样本质量，只增加开销；
+6. MC-64 比 rollout 更慢且不更准，暂不推荐；
+7. R2 的推荐 incumbent 是 `Dynamic-tail + Full-flow top-2 rollout + WAIT candidate + timeout fallback`；R3 应围绕 combined-hard 设计更深但受限的 joint wait/order lookahead，而不是继续堆静态 bonus。
+
+正式 R2 输出为 `outputs/nonpreemptive_parallel_chains/r2_summary.json`。本阶段没有修改 `docs/260804组会.md`，也没有修改通用 schema/executor/baseline。
+
+最终 R0--R2 联合定向回归为 `29 passed`，R2 单独为 `10 passed`。完整 `pytest tests -q` 为 `869 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的仓库外 `Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与 R2 无关。`git diff --check` 和人工 100 字符 Python 行宽检查通过；环境仍未安装 `ruff`。
+
+## R2 补充：旧实验矩阵的不可抢占全因子复现（2026-08-09）
+
+### 1. 为什么补做
+
+上一节已经重做了 Dynamic-tail、Rollout-2、WAIT-aware Rollout、Beam 和 Monte Carlo，
+但没有把早期阶段二中用过的候选数、Beam 宽度以及是否允许 WAIT 全部逐项展开。
+本节在同一批固定种子实例上补齐这些组合，避免把“搜索方法变化”和“主动等待变化”混在一起。
+
+统一语义仍是：每个 flow 一旦开始便独占单 channel 直至完成；compute 也不可抢占；只有节点完成时
+才能重规划；optional-idle 算法可以等待到下一个 compute 完成事件。所有启发式解都通过 R0 DAG
+执行器回放。正式输出仍为 `outputs/nonpreemptive_parallel_chains/r2_summary.json`。
+
+补齐的增强算法如下：
+
+- `Rollout-flow-{2,4}`：从 Dynamic-tail 排名前 2 或 4 的 ready flow 中，分别假设完整执行该
+  flow，再用 Dynamic-tail 补全，选择预计完工时间最小者；不允许主动等待。
+- `Rollout-WAIT-{2,4}`：除上述 flow 外，把“等到下一次 compute 完成”也作为候选动作。
+- `Beam-flow-{8,32}`：仅扩展 flow 动作，每层保留预计最好 8 或 32 个部分调度。
+- `Beam-WAIT-{8,32}`：同时扩展 flow 与 WAIT 动作，每层保留 8 或 32 个状态。
+- `MC-flow-64` 与 `MC-WAIT-64`：分别在不含/包含 WAIT 的动作空间内做 64 次随机补全，保留
+  最好结果。二者使用相同总采样预算，而不是每类动作各 64 次。
+
+### 2. 随机小实例的全因子结果
+
+100 个正式实例使用 seed `260813`；表中最优率和比值均相对允许主动等待的 exact oracle。
+运行时间只是本机单次 Python 小实例开销，用于看同组实验的相对成本。
+
+| 算法 | 最优数 | 平均比 | 最坏比 | 平均时间 |
+|---|---:|---:|---:|---:|
+| Rollout-flow-2 | 91/100 | 1.00525 | 1.1154 | 1.83 ms |
+| Rollout-flow-4 | 91/100 | 1.00525 | 1.1154 | 2.74 ms |
+| Rollout-WAIT-2 | 95/100 | 1.00234 | 1.0556 | 2.55 ms |
+| Rollout-WAIT-4 | 95/100 | 1.00234 | 1.0556 | 3.37 ms |
+| Beam-flow-8 | 93/100 | 1.00436 | 1.1154 | 5.70 ms |
+| Beam-flow-32 | 93/100 | 1.00436 | 1.1154 | 11.09 ms |
+| Beam-WAIT-8 | **100/100** | **1.00000** | **1.0000** | 7.09 ms |
+| Beam-WAIT-32 | **100/100** | **1.00000** | **1.0000** | 14.99 ms |
+| MC-flow-64 | 91/100 | 1.00532 | 1.1154 | 14.80 ms |
+| MC-WAIT-64 | 91/100 | 1.00587 | 1.1154 | 16.22 ms |
+
+逐因素配对结果为：
+
+| 改动 | 改善 | 相同 | 变差 |
+|---|---:|---:|---:|
+| Rollout-flow-2 -> flow-4 | 0 | 100 | 0 |
+| Rollout-WAIT-2 -> WAIT-4 | 0 | 100 | 0 |
+| Beam-flow-8 -> WAIT-8 | 7 | 93 | 0 |
+| Beam-flow-32 -> WAIT-32 | 7 | 93 | 0 |
+| MC-flow-64 -> WAIT-64 | 2 | 95 | 3 |
+
+因此，top-4 在当前短链分布上没有补到 top-2 漏掉的选择，只增加约 32%--50% 的时间；Beam
+加入 WAIT 后恰好修复全部 7 个 idle-hard 实例。Monte Carlo 的反常结果不是 WAIT 本身有害，而是
+固定 64 次预算被更大的动作空间稀释：它虽然改善 2 图，却使 3 图变差。若继续研究 MC，应给
+FLOW 和 WAIT 分层采样或分别保证配额，并始终保留 deterministic rollout/Beam incumbent。
+
+### 3. 受限情形矩阵
+
+为区分偶然命中和结构性规律，又补做四组枚举或随机受限实例：
+
+| 实例族 | 数量 | idle-hard | Longest-delay 最优率/最坏比 | Dynamic-tail 最优率/最坏比 | LRPT 最优率/最坏比 |
+|---|---:|---:|---:|---:|---:|
+| 每链单 flow、初始全 ready | 200 | 0 | 100% / 1.000 | 100% / 1.000 | 62.5% / 1.250 |
+| 所有 compute 为 0、初始全 ready | 100 | 0 | 100% / 1.000 | 100% / 1.000 | 100% / 1.000 |
+| 等长通信、3 链各 2 flow | 729 | 0 | 74.49% / 1.333 | 100% / 1.000 | 100% / 1.000 |
+| 链内 compute lag 非增 | 576 | 8 | 81.42% / 1.429 | 93.92% / 1.200 | 88.02% / 1.286 |
+
+前两行分别对应上一节已经证明的“单 flow tail 排序”和“纯通信总量”结论。后两行目前只是有限
+枚举证据：尤其不能由 729 个等长通信实例直接宣称 Dynamic-tail 或 LRPT 对任意链数、深度都最优。
+非增 lag 仍出现 8 个 idle-hard，说明“链内计算越来越短”并不足以消除主动等待价值。
+
+### 4. 规模与 exact oracle 边界
+
+使用同一生成器各取一个较大实例，并给 exact DP 设置 30000 状态、2 秒预算：
+
+| 链数 | flow 数 | exact/状态数 | Beam-flow/wait 8 | Beam-flow/wait 32 | MC-flow/wait 64 |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 7 | 16 / 623 | 16 / 16 | 16 / 16 | 16 / 16 |
+| 6 | 14 | 31 / 19411 | 31 / 31 | 31 / 31 | 31 / 31 |
+| 8 | 15 | 超预算 | 34 / 34 | 34 / 34 | 34 / 34 |
+| 10 | 19 | 超预算 | 34 / 34 | 34 / 34 | 34 / 34 |
+
+4、6 链时可由 oracle 确认所有列最优；8、10 链只有算法间一致，不能写成“已经证明最优”。
+这也验证了 operation-level DP 的组合爆炸：从 7 flow 的 623 状态上升到 14 flow 的 19411 状态，
+再稍微增大就触及预算。因此 exact 更适合小图 oracle、局部窗口或结构压缩后的子问题。
+
+### 5. 固定反例复核
+
+- Dynamic-tail 的旧 $5/4$ 渐近族在 scale `1,2,4,8,16` 上分别得到
+  `OPT=9,17,33,65,129` 和 `DT=10,20,40,80,160`；两种 Rollout-2 均得到 OPT。
+- Work-conserving tight-2 族在 $M=10,20,50,100$ 上的比值依次为
+  `1.75, 1.8636, 1.9423, 1.9706`；Rollout-WAIT-2 均选择等待并得到 OPT。
+- 固定 Beam 反例的 `OPT=46`：Beam-flow-8、Beam-WAIT-8、Beam-WAIT-32 都为 47，只有
+  Beam-flow-32 为 46。因此“本批 100 图全最优”仍不能当作 Beam-WAIT 的 exact 性质，也不能认为
+  width 32 单调支配 width 8；启发式截断和评分会改变保留的状态集合。
+
+### 6. 补充实验后的选择
+
+在线默认仍推荐 `Dynamic-tail + full-flow top-2 rollout + WAIT + timeout fallback`：它在这批实例上
+达到 95% exact，成本显著低于 Beam/MC，而且候选数从 2 增到 4 没有收益。Beam-WAIT-8 可作为
+小窗口离线增强或更强实验对照，它确实解决了本批全部 idle-hard，但已有固定反例。当前 MC-64
+不推荐；若重新设计，应先解决动作分层采样问题。以上表格取代上一节未展开 flow/WAIT 因子的增强
+算法行；上一节的基础 priority 结果和 2-approximation/tight 证明不变。
+
+补充后的 R0--R2 联合定向回归为 `26 passed`，其中 R2 文件为 `12 passed`。完整
+`pytest tests -q` 为 `871 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的仓库外
+`Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与本次修改无关。本段计数取代上一节补充实验
+之前记录的 `29/10/869` 历史计数。
+
+## 修订阶段 R3：从并行链推广到一般 DAG（2026-08-09）
+
+### 1. 阶段目标与实现边界
+
+本阶段把 R2 的并行链算法推广到含 fork、join、多层依赖的一般 DAG，并重新检查旧阶段 3 的结论。
+实现位于 `scripts/study_nonpreemptive_general_dag.py`，仍是隔离研究原型，没有修改通用
+schema、executor 或 Default/Puppeteer/Hermod。它直接调用 R0 状态机，因此：
+
+- FLOW 动作会让一条通信独占 channel，完整执行到结束；
+- compute 一旦依赖满足便立即开始，并连续执行到结束；
+- active flow 期间发生的 compute completion 只更新依赖，不产生抢占点；
+- channel 空闲时才能重新选择 `FLOW(v)` 或 `WAIT_TO_NEXT_RELEASE`。
+
+正式集合包含 7 个旧 adversarial motif、1 个 raw-join 固定例、3 个 combined-hard 固定图和 seed
+`260817` 生成的 100 个 random join DAG，共 111 图。每图都由 R1 exact oracle 分别求
+`OPT_idle` 和 `OPT_wc`，启发式时间线再由 R0 回放并检查每个节点只有一个连续区间。
+
+### 2. Residual Dynamic-tail 与一般 DAG 特征
+
+对决策状态 $s$，令 $d_s(v)$ 为节点剩余时间：completed 为 0，running compute 使用 remaining，
+pending 节点使用原 duration。忽略 channel contention 的 residual earliest finish 为：
+
+$$
+E_s(v)=d_s(v)+
+\max_{u\in pred(v),\ d_s(u)>0}E_s(u).
+$$
+
+反向计算 residual path 和 flow 完成后的 tail：
+
+$$
+L_s(v)=d_s(v)+\max_{w\in succ(v)}L_s(w),
+\qquad
+Q_s(v)=\max_{w\in succ(v)}L_s(w).
+$$
+
+Non-preemptive Dynamic-tail 只在 channel 空闲时，从 ready flows 中选 $Q_s(v)$ 最大者。这里的
+tail 是 residual DAG 上的动态量；active flow 期间可以重新计算未来分数，但绝不据此切换 active
+flow。安全 residual lower bound 使用：
+
+$$
+LB(s)=\max\left(
+\sum_{v\text{ is unfinished FLOW}}d_s(v),
+\max_v L_s(v)
+\right).
+$$
+
+另外实现了四类候选来源：SPT、直接后继 compute 最长、join latest-blocker、以及能在下一次
+compute release 前完成或最少越过 release 的 flow。它们只负责扩充动作集合，不与 tail 做线性加权。
+
+### 3. Join 建模：候选和最终评价必须分开
+
+对 join 子节点 $x$ 的未完成父节点 $v$，原始 last-blocker 信号近似为：
+
+$$
+g_s(v,x)=\max\left(0,
+E_s(v)-\max_{u\in pred(x)\setminus\{v\}}E_s(u)
+\right).
+$$
+
+`Raw-join` 直接用 `tail + join_gain` 排序；`Hybrid` 则只把 Join/SPT/long-delay/future-release
+各自最优的 flow 加入候选，最终统一评价完整后果。对动作 $a$：
+
+$$
+\widehat C(s,a)=
+\Delta(a)+J_{DT}(T(s,a)),
+$$
+
+其中 FLOW 的 $\Delta$ 是完整通信时长，WAIT 的 $\Delta$ 是到下一 compute completion 的时间，
+$J_{DT}$ 是从后继状态用 whole-flow Dynamic-tail 补全的端到端 makespan。等待价值因此是：
+
+$$
+V_{wait}(s)=
+\min_{a\in FLOW(s)}\widehat C(s,a)-\widehat C(s,WAIT).
+$$
+
+只有 $V_{wait}>0$ 才值得主动空闲；不存在额外的手调 WAIT bonus。
+
+Join 消融给出了很清楚的结果：
+
+| 检查 | 结果 |
+|---|---:|
+| Raw-join 相对 Dynamic-tail 改善/相同/变差 | **0 / 86 / 25** |
+| Join 在 Dynamic 时间线上提供 top-2 外候选的图 | 24/111 |
+| 新 Join 候选出现次数 | 38 |
+| Hybrid-WAIT-2 相对纯 Dynamic-WAIT-2 改善/变差 | **0 / 0** |
+
+所以 raw join bonus 在不可抢占模型下仍然有重复奖励/错误放大问题，而且比旧模型暴露得更明显。
+Join 候选并非没有改变候选集，但这 38 次差异全部被端到端评价否决；当前没有证据要求在线策略
+强制保留 Join 候选。保留“候选生成器”接口仍有价值，因为真实 LLM DAG 可能产生当前随机生成器
+没有覆盖的 join pattern，但在得到独立收益前不能进入默认策略。
+
+### 4. Full-flow rollout 与二层联合 lookahead
+
+本阶段比较以下增强：
+
+- `Rollout-flow-2`：Dynamic-tail top-2，只评价完整 FLOW，不主动等待；
+- `Rollout-WAIT-2`：在上述候选中加入 WAIT；
+- `Hybrid-flow/WAIT-2`：再加入四类结构候选；
+- `Hybrid-WAIT-{2,4}-depth2`：枚举连续两个完整动作后再用 Dynamic-tail 补全，用于处理
+  “先修正顺序、下一步才看出等待价值”的 combined-hard；
+- `Beam-WAIT-8`：在完整 FLOW/WAIT 状态空间保留 8 个最好状态，并始终保留完整 Dynamic-tail
+  schedule 作为 incumbent。
+
+所有 rollout 的候选都包含 base action，最终还与完整 baseline 比较；超时会回退 baseline。因此实验
+中的增强逐实例不差于 Dynamic-tail。不过 R2 的独立链 2-approximation 证明不能直接用于一般 DAG，
+所以这里的 incumbent safeguard 只证明相对支配 $T_{enhanced}\le T_{DT}$，不宣称一般 DAG 上已有
+常数近似比。
+
+### 5. 正式总体结果
+
+比值均相对 `OPT_idle`：
+
+| 方法 | 最优数 | 平均比 | 最坏比 | 平均时间 |
+|---|---:|---:|---:|---:|
+| Dynamic-tail | 97/111 | 1.010168 | 1.176471 | 1.14 ms |
+| Raw-join | 72/111 | 1.027700 | 1.190476 | 1.08 ms |
+| Rollout-flow-2 | 101/111 | 1.006561 | 1.176471 | 9.67 ms |
+| Rollout-WAIT-2 | 107/111 | 1.001868 | 1.062500 | 12.53 ms |
+| Hybrid-flow-2 | 101/111 | 1.006561 | 1.176471 | 11.09 ms |
+| Hybrid-WAIT-2 | 107/111 | 1.001868 | 1.062500 | 14.52 ms |
+| Hybrid-WAIT-2-depth2 | **110/111** | **1.000429** | 1.047619 | 34.43 ms |
+| Hybrid-WAIT-4-depth2 | **110/111** | **1.000429** | 1.047619 | 40.16 ms |
+| Beam-WAIT-8 | **110/111** | **1.000375** | **1.041667** | 45.37 ms |
+
+`top-4` 与 `top-2` 的 makespan 在 111 图上完全相同，只把二层 rollout 平均开销从 34.43 ms
+增加到 40.16 ms。Hybrid 与纯 Dynamic candidate rollout 也完全相同，说明当前收益来自完整
+counterfactual、WAIT 和第二层联合搜索，不来自 Join 等额外候选。
+
+WAIT 的动作并没有被滥用：Rollout-WAIT-2 在 9 图上各主动等待一次，总等待 11 个时间单位；
+二层方法在 10 图上共等待 10 次、16 个时间单位；Beam 在 10 图上共等待 10 次、12 个时间单位。
+
+### 6. 三类困难集
+
+定义保持与规划一致：
+
+```text
+ordering-hard: Dynamic-tail > OPT_wc
+idle-hard:     OPT_wc > OPT_idle
+combined-hard: 两个不等式同时成立
+```
+
+三个集合可以重叠；combined-hard 同时计入前两类。表中 `改善` 是严格优于 Dynamic-tail，
+`exact` 是达到 `OPT_idle`，gap closed 为
+`(DT - H) / (DT - OPT_idle)`：
+
+| 方法 | ordering 7：改善/exact/gap | idle 10：改善/exact/gap | combined 3：改善/exact/gap |
+|---|---:|---:|---:|
+| Rollout-flow-2 | 5/4/66.67% | 1/0/6.67% | 1/0/22.22% |
+| Rollout-WAIT-2 | **7/4/80.95%** | **9/7/81.67%** | **3/1/72.22%** |
+| Hybrid-WAIT-2-depth2 | **7/6/95.24%** | **10/9/96.67%** | **3/2/88.89%** |
+| Beam-WAIT-8 | 6/6/85.71% | **10/10/100%** | **3/3/100%** |
+
+这解释了为什么只看总体最优率会误导：flow-only rollout 几乎不能修 idle-hard，而 WAIT-2 已经在
+三类集合上都稳定正收益；第二层又专门补上“一次动作还看不见等待后果”的 combined case。
+三个 combined 固定图的 `(OPT_idle, OPT_wc, DT, WAIT-2, depth2, Beam)` 分别为：
+
+```text
+combined_chain_14: (21, 22, 24, 22, 22, 21)
+combined_chain_70: (18, 19, 20, 18, 18, 18)
+combined_chain_86: (24, 25, 26, 25, 24, 24)
+```
+
+二层 rollout 唯一未最优的是 `combined_chain_14`：22 对 OPT 21；Beam 修复它。Beam 唯一未最优
+的是 ordering-only 的 `random_join_60`：25 对 OPT 24，而二层 rollout 修复它。二者各 110/111
+但失败集合不同，再次说明有限搜索之间不存在简单支配关系。
+
+### 7. `random_join_30/40` 的不可抢占重验
+
+两图都属于 ordering-hard，不属于 idle-hard；新 oracle 仍给出 22 和 21。通信动作顺序为：
+
+```text
+random_join_30
+DT:      WAIT, c1_0, c0_0, WAIT, c0_1, c1_1, WAIT, final_comm, WAIT  -> 24
+Rollout: WAIT, c0_0, c1_0, WAIT, c0_1, c1_1, WAIT, final_comm, WAIT  -> 22
+
+random_join_40
+DT:      WAIT, c1_0, c0_0, c3_0, c2_0, WAIT, c0_1, c1_1, c2_1, ... -> 22
+Rollout: WAIT, c1_0, c2_0, c0_0, c3_0, c2_1, c1_1, c0_1, ...       -> 21
+```
+
+这里的省略部分都是 join 后的强制 WAIT、`final_comm` 和 sink compute。每条通信都是一个连续
+区间；改善来自重新排列完整 flow，而不是在中途切换。`random_join_30` 先触发 `c0_0` 的长后续
+compute，`random_join_40` 则更早触发 `c2_0/c2_1` 分支，从而让 join 更早满足。
+
+### 8. 理论边界与 R3 结论
+
+独立链的证明能把所有 forced idle 注入最后完成链的 compute，总有 $I\le Q$。一般 fork/join 中，
+不同 idle 区间的最后阻塞者可能来自不可比较分支；按实际 schedule 加入 channel-order 边后虽然能
+得到一条长度等于 makespan 的 augmented critical path，但其中的 compute 段未必构成原 DAG 的
+单一路径。因此当前不能用原 DAG critical path $L$ 直接证明 $I\le L$，也不能把 R2 的 tight-2
+定理未经证明地外推到一般 DAG。
+
+本阶段得到的可证明保证只有：候选始终含 Dynamic base action、完整补全用于评价、最终保留完整
+baseline，因此 rollout/Beam 返回值不差于 Dynamic-tail。若要研究一般 DAG 常数界，需要继续证明
+augmented blocking chain 的 compute 能否由 `OPT` 充电，或给出反例；111 图的最大经验比 1.176
+不是理论上界。
+
+R3 退出条件已经满足：Full-flow + WAIT rollout 相对 Non-preemptive Dynamic-tail 在 ordering-hard
+改善 7/7、idle-hard 改善 9/10、combined-hard 改善 3/3；二层版本进一步达到 7/7、10/10、3/3，
+且所有方法保留 baseline incumbent。当前在线候选建议仍是便宜的 Dynamic-WAIT-2；如果局部窗口
+允许约 3 倍开销，再使用 depth-2。Join 候选暂不默认启用，Beam-WAIT-8 继续作为离线强对照。
+
+正式输出为 `outputs/nonpreemptive_general_dag/r3_summary.json`。
+
+R0--R3 联合定向回归为 `32 passed`，R3 专项为 `6 passed`。完整 `pytest tests -q` 为
+`877 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的仓库外
+`Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与 R3 无关。
+
+## 修订阶段 R4：多资源拓扑的不可抢占扩展（2026-08-09）
+
+### 1. 为什么旧多资源结果必须重做
+
+旧 `study_multiresource_dag.py` 的状态是每个 tick 重新选择一组 flow：本 tick 被选择的 flow 在下一
+tick 可以从集合中消失，之后再恢复；即使 `advance_to_event` 连续走若干 tick，compute completion
+也可能成为重新选集合的边界。因此它仍是 integral-quantum preemptive 模型，不能表示“flow 开始后
+占有整条 route 直到传完”。旧阶段 4 的 exact、pack、set rollout 以及 0.39%--1.15% 收益继续保留
+为历史记录，但不能作为目标模型结论。
+
+R4 新实现为 `scripts/study_nonpreemptive_multiresource_dag.py`，仍不修改生产 executor。复用了旧的
+`MultiResourceInstance`、directed-link/NIC route adapter、BFS route 和手工拓扑构造，但状态转移、
+exact oracle 与所有调度策略均重新实现。
+
+### 2. 新状态和动作语义
+
+事件状态保存：
+
+```text
+每个 task 的 pending/running/completed、remaining、start/completion time
+active flows 及其完整 directed-link/NIC resource set
+active computes
+ready but not started flows
+当前事件时间
+```
+
+令 active flow 占用资源并集为 $U(s)$，ready flows 为 $R(s)$。合法启动集合满足：
+
+$$
+S\subseteq R(s),\qquad
+routes(S)\text{ 两两不交},\qquad
+routes(S)\cap U(s)=\varnothing.
+$$
+
+Optional-idle 动作为：
+
+$$
+A_{idle}(s)={START(S):S\ne\varnothing,\ S\text{ 合法}}
+\cup\{WAIT\},
+$$
+
+其中只有存在 active flow/compute 的未来完成事件时 WAIT 才合法。执行 `START(S)` 后，$S$ 中所有
+flow 同时启动；已有 active flow 和新 flow 都保持运行，直到最早的 active task completion。此时只
+移除真正完成的 flow，其余 flow 保留 remaining 和 route reservation，然后才能进行下一次决策。
+
+Work-conserving 对照只允许 inclusion-maximal 合法启动集合；如果没有能与 active routes 共存的新
+flow，才被迫 WAIT。这里的 work-conserving 是“当前所有可用资源都不能再塞入 ready flow”，不是
+单通道中的“只要有 ready flow 就必须启动”。
+
+### 3. 为什么不能只枚举最大兼容集合
+
+固定手算图 `nonmaximal_start_np`：
+
+```text
+t=0 ready:
+  a: comm(4), route r0
+  b: comm(5), route r1
+
+release_c: compute(1)
+  -> c: comm(1), route r1
+  -> c_tail: compute(6)
+```
+
+若要求最大集合，`t=0` 必须同时启动 `{a,b}`。`c` 在 `t=1` ready，却必须等 `b` 到 `t=5` 才能
+使用 r1：
+
+```text
+a [0,4), b [0,5), c [5,6), c_tail [6,12)  => 12
+```
+
+Optional oracle 选择非最大集合 `{a}`，给未来关键 release 留出 r1：
+
+```text
+a [0,4), c [1,2), b [2,7), c_tail [2,8)   => 8
+```
+
+因此 inclusion-maximal start sets 对目标问题不具支配性；“现在多启动一条与 active flows 不冲突的
+flow”可能占住未来关键 flow 需要的 route。该图中 `OPT_wc=12`、`OPT_idle=8`，差距不是带宽共享
+或抢占造成的，而是启动时机本身造成的。
+
+另一个 `active_reservation_np` 图验证持久占用：`a(r_shared,4)` 与 `b(r_other,1)` 在 `t=0` 同时
+启动；`t=1` 的 `b` 完成并释放 `c(r_shared,1)`，但 `a` 仍 active，所以 `c` 只能等待到 `t=4`。
+测试明确检查了 `t=1` 时 `active={a}`、`ready={c}`、`START(c)` 非法。
+
+### 4. Exact oracle、下界和策略
+
+Optional exact DP 枚举所有非空合法子集和 WAIT；work-conserving DP 枚举所有最大合法子集。状态 key
+包含每个 task 的 status/remaining，active route 可由 running flows 唯一恢复。相同后继状态被缓存，
+最终 action path 重新执行并检查：
+
+- 每条 flow 只有一个连续正长度区间；
+- 时间重叠的两条 flow 不共享任何 directed link/NIC resource；
+- active flow 未完成前不能从 reservation 中消失；
+- compute/flow completion 是唯一决策事件。
+
+安全 residual lower bound 为：
+
+$$
+LB(s)=\max\left(
+L_{DAG}(s),
+\max_{r}\sum_{v:r\in route(v)}d_s(v)
+\right).
+$$
+
+比较的启发式包括：
+
+- `Dynamic-pack`：按 residual tail 排序，依次装入与 active/已选 routes 兼容的 flow；
+- `Resource-pack`：tail 相同时优先 residual resource load 更大的 flow；
+- `Bottleneck-pack`：首先处理最大 residual bottleneck load；
+- `Rollout-maximal-2`：只从最大兼容集合中选两个候选，用完整 Dynamic-pack 补全评价；
+- `Rollout-optional-{2,4}`：允许非最大子集和 WAIT，再用同一端到端补全评价；完整 Dynamic-pack
+  始终作为 incumbent，超时回退 incumbent。
+
+### 5. 手工拓扑和 route adapter 验证
+
+除 4 个逻辑资源 motif 外，又通过真实 `BfsStrategy + route_resource_sets` 构造了三个 8-GPU 小图；
+资源包括 directed route links、source NIC TX 和 destination NIC RX：
+
+| 拓扑 | 关键冲突 | 多资源 OPT | 单通道 OPT | 单通道高估 |
+|---|---|---:|---:|---:|
+| single-switch | 四对 GPU 使用互不相交的端口链路 | 9 | 12 | 33.33% |
+| two-rack | 两条跨 rack flow 共享 `(8,9)` | 11 | 12 | 9.09% |
+| four-rack-core | 同一 rack-pair flow 共享 core links，不同 pair 可并行 | 11 | 12 | 9.09% |
+
+这三个图的 optional exact 分别探索 501/335/273 个状态、869/595/498 个动作，所有启发式都得到
+对应 OPT。它们的目的不是模拟真实机器性能，而是透明验证 BFS route、active reservation 和并行
+合法性确实贯通。
+
+### 6. 正式 37 图结果
+
+集合包含 4 个手算 motif、3 个 BFS 小拓扑和 seed `260819` 的 30 个 random route-conflict DAG。
+比值均相对 non-preemptive optional-idle multi-resource OPT：
+
+| 方法 | 最优数 | 平均比 | 最坏比 | 平均时间 |
+|---|---:|---:|---:|---:|
+| Dynamic-pack | 30/37 | 1.027245 | 1.500000 | 0.92 ms |
+| Resource-pack | 30/37 | 1.023642 | 1.500000 | 0.97 ms |
+| Bottleneck-pack | 31/37 | 1.024092 | 1.500000 | 1.10 ms |
+| Rollout-maximal-2 | 33/37 | 1.018861 | 1.500000 | 9.81 ms |
+| Rollout-optional-2 | **36/37** | **1.001422** | **1.052632** | 11.69 ms |
+| Rollout-optional-4 | **36/37** | **1.001422** | **1.052632** | 12.34 ms |
+
+Dynamic-pack 非最优的 hard subset 有 7 图：Resource/Bottleneck 各严格改善 1 图，Bottleneck 修到
+exact 1 图；Maximal rollout 改善并修到 exact 3 图；Optional rollout 改善 6 图且全部修到 exact。
+唯一未修复的是 `random_join_1`：20 对 OPT 19。top-4 与 top-2 无质量差异，只增加开销。
+
+Optional-idle exact 在 4/37 图优于 maximal work-conserving exact，最大改善 4。Optional rollout
+显式主动 WAIT 只发生 2 次；另外的收益来自启动非最大子集，而不是空等整个系统。这说明多资源下
+“主动等待”应理解为两种控制：`START(non-maximal S)` 保留部分资源，以及 `WAIT` 保留全部资源。
+
+完整时间线中平均每图约有 5.16 个 Dynamic start events、2.30 个 ready-flow conflict events；
+Maximal/Optional rollout 平均评价 11.49/15.89 个候选动作。Exact DP 平均探索 1565.5 个状态、
+3636.3 个动作，最大为 10878 状态、26222 动作；所有 37 图均未触及 500000 状态或 30 秒限制。
+
+### 7. 单通道抽象会高估多少
+
+把每图所有 route resource 合并成同一 `single_channel`，再求同语义 optional-idle exact。相对真实
+route-resource OPT：
+
+```text
+平均高估：15.50%
+最大高估：57.14%
+```
+
+因此单通道适合研究“顺序与等待”的核心机制，但不能用来估计具体拓扑 makespan。高估大小取决于
+route 是否真正共享 directed links/NIC，而不是 GPU 数量本身。
+
+### 8. 理论边界和当前结论
+
+多资源问题同时包含 precedence、不可抢占 route reservation、并行 compatible-set packing 和未来
+release。只保留 maximal sets 已被 12/8 反例否定；单资源的 $P+Q$ charging 也不能用于多个可并行
+resource loads。当前可安全使用的是上述 `max(critical path, max resource load)` 下界和 exact 小窗口，
+尚未得到 Dynamic/Resource/Bottleneck pack 或 Optional set rollout 的一般常数近似比。37 图最坏
+经验比不是理论保证。
+
+R4 退出条件已经满足：手算图验证了 active route reservation、不可抢占、WAIT 和非最大启动；三种
+真实 BFS 小拓扑验证 route adapter；optional/work-conserving exact 在小窗口完成；所有启发式 action
+均通过相同合法性回放。下一阶段 R5 可以把 LLM backbone/deferred/optimizer/dimension 特征转成
+完整 `START(S)` 候选，并重点判断是否应给即将释放的 PP/TP 关键 flow保留部分 route resources。
+
+正式输出为 `outputs/nonpreemptive_multiresource/r4_summary.json`。
+
+R0--R4 联合定向回归为 `39 passed`，R4 专项为 `7 passed`。完整 `pytest tests -q` 为
+`884 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的仓库外
+`Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与 R4 无关。
+
+## 修订阶段 R5：LLM DAG 结构特化（2026-08-09）
+
+### 1. 目标和旧实现审计
+
+R5 的目标不是再设计一个 `tail + semantic bonus`，而是回答：LLM metadata 能否提出 general
+Full-flow + WAIT rollout 没有覆盖的合法 `START(S)`，并在至少两个 workload/placement 场景中缩短
+端到端 makespan。
+
+旧 `study_llm_structured_candidates.py` 的 sidecar 定义仍有用，但候选集合在旧 tick/preemptive
+`MultiResourceDAG` 上执行，cache 也可能复用“下一 tick 选择哪些 flow”的旧集合。因此旧语义收益
+不能沿用。新实现为 `scripts/study_nonpreemptive_llm_structured.py`，直接建立在 R4 状态机上：每个
+candidate 都是启动完整 flow/set 或 WAIT，active flow 不会因新事件被移除。
+
+正式结构 probe 使用真实 pipeline builder、serializer、effective DAG、BFS route 和 directed
+link/NIC resources；使用的是仓库内 homogeneous probe profile，不是最终真实 AICB 性能实验。真实
+AICB、控制开销与扰动属于 R6。
+
+### 2. General baseline 与 LLM 候选
+
+同预算 general portfolio 包含：
+
+```text
+Dynamic-pack
+Resource-pack
+Bottleneck-pack
+SPT-pack
+LPT-pack
+WAIT（存在 active completion event 时）
+```
+
+LLM portfolio 在此基础上增加：
+
+- `backbone_first`：优先完整启动 forward/backward-input 的 PP/TP flows；
+- `deferred_gap_fill`：预测下一 backbone release，只启动能在 release 前完成或 route 不冲突的
+  DP/backward-weight flow，允许形成非最大集合；
+- `optimizer_deadline`：生成优先处理 deferred DP/W 的完整集合，由端到端评价决定是否已到 deadline；
+- `dimension_{PP,TP,DP,EP}`：分别生成各通信维度优先的 pack；
+- `replica_wavefront`：按 DP/TP replica 坐标生成同类 flow 的另一种完整开始顺序；
+- `chunk_wavefront`：按 Ring chunk 次序生成同模板 flow 的另一种 wavefront。
+
+候选评价保持统一。对完整动作 $a$：
+
+$$
+\widehat C(s,a)=\Delta(a)+J_{DynamicPack}(T(s,a)).
+$$
+
+General 和 semantic 使用相同的 Dynamic-pack completion；semantic 最终显式保留完整 general
+rollout schedule 作为 incumbent，因此：
+
+$$
+T_{semantic}\le T_{general}\le T_{dynamic}.
+$$
+
+这只是实现上的逐实例支配，不是新的常数近似保证。
+
+### 3. `deferred_gap_fill` 的不可抢占含义
+
+令下一条 pending backbone flow 为 $b$，乐观 release 时间为 $\delta_b$。Ready deferred flow $v$
+只有满足下列至少一个条件才进入 gap-fill candidate：
+
+$$
+p_v\le\delta_b
+\quad\text{或}\quad
+route(v)\cap route(b)=\varnothing.
+$$
+
+第一种表示 $v$ 能在 backbone ready 前完整传完；第二种表示即使仍 active，也不会占用 backbone 的
+route。其余长且冲突的 DP/W 被暂缓。这不是抢占：一旦选入 $S$，仍必须完整执行。
+
+固定机制图中，general rollout 只能在“同时启动 long-DP + safe-W”和“全局 WAIT”之间选择，得到
+10；gap-fill 只启动 route 不冲突的 safe-W，在 `t=1` 启动 PP，得到 exact OPT 9：
+
+```text
+General WAIT:     WAIT [0,1), PP + safe-W from t=1                     => 10
+Semantic gap-fill: safe-W [0,3), PP [1,2), long-DP [2,7), two tails  =>  9
+```
+
+两个交换 route 标签的等价 motif 都复现 `10 -> 9`。Leave-one-out 中只有删除
+`deferred_gap_fill` 会退回 10；删除其他任一语义特征仍为 9。两事件 exhaustive teacher 的 value
+coverage 由 general 50% 提升到 semantic 100%，唯一 semantic-only 命中正是 gap-fill。
+
+### 4. 四个完整 pipeline probe
+
+配置固定为 `ga=2,layers=2,quantum=25us`，比较 1F1B/基础双向流水线和两种高冲突 placement：
+
+| 场景 | tasks/flows | Dynamic | General | Semantic | 相对 General 改善 |
+|---|---:|---:|---:|---:|---:|
+| 1F1B + four-rack-core + TP-cross | 304/160 | 772 | 765 | **762** | **3，0.39%** |
+| Bidirectional + four-rack-core + TP-cross | 400/256 | 786 | 775 | **773** | **2，0.26%** |
+| 1F1B + two-rack + PP-cross | 304/160 | 766 | 766 | 766 | 0 |
+| Bidirectional + two-rack + PP-cross | 400/256 | 780 | 780 | 780 | 0 |
+
+两个正收益场景中，semantic schedule 都只使用了一次 general portfolio 外的动作，标签均为
+`chunk_wavefront`。去掉它后分别从 762/773 精确退回 general 的 765/775；这是相对 general
+WAIT rollout 的独立 leave-one-feature-out 证据，而不只是相对 Dynamic-pack 的收益。
+
+two-rack PP-cross 没有收益同样重要：LLM metadata 不会自动改善所有拓扑。当前 `chunk_wavefront`
+的价值限定为 four-rack TP 冲突中，同模板 Ring chunks 的启动顺序会改变后续 compute/flow release
+时间。不能把 0.39%/0.26% 外推成任意模型、拓扑或 placement 的平均收益。
+
+### 5. Teacher coverage
+
+前两个高冲突场景各抽取 Dynamic 时间线前 64 个 ready width 不超过 8 的事件，枚举全部合法
+非最大 START subsets 和 WAIT，再用同一 Dynamic completion 得到 one-event teacher：
+
+| 场景 | General value coverage | Semantic value coverage | Semantic-only events |
+|---|---:|---:|---:|
+| 1F1B four-rack TP-cross | 85.94% | **96.88%** | 7 |
+| Bidirectional four-rack TP-cross | 73.44% | **78.13%** | 3 |
+
+Teacher 命中标签主要是 `replica_wavefront` 和 `chunk_wavefront`：1F1B 分别命中 12/10 次，
+bidirectional 分别命中 1/4 次。Teacher coverage 的提升大于最终 makespan 提升，因为许多局部等价
+或更优动作不在最终关键链上；这再次说明候选覆盖不能替代完整 schedule 指标。
+
+### 6. 周期缓存
+
+缓存只保存压缩 frontier 对应的“候选标签”，命中时必须在当前状态重新生成合法完整动作；不会缓存
+task id 集合，更不会恢复或中断 active flow。四个场景的 `(hit/miss, semantic ms, cached ms)` 为：
+
+```text
+1F1B four-rack:          67/47, 14071 ->  9380 ms
+Bidirectional four-rack: 37/83, 23193 -> 17242 ms
+1F1B two-rack:           73/50, 15550 ->  9927 ms
+Bidirectional two-rack:  34/99, 26585 -> 23150 ms
+```
+
+缓存后四图 makespan 全部与未缓存 semantic 相同，并显式保留 general incumbent。但即使缓存后仍为
+9.4--23.2 秒，而 Dynamic greedy 只有约 0.14--0.23 秒；当前仍只能作为离线 teacher，不能声称
+调度收益大于在线控制开销。
+
+### 7. R5 结论和退出条件
+
+R5 得到了两个层次的正结果：
+
+1. `deferred_gap_fill` 在两个可手算 PP release motif 上相对 general WAIT rollout 独立改善 10 到 9，
+   并由 exact、teacher 和 leave-one-out 三重确认；
+2. `chunk_wavefront` 在 1F1B 与 Bidirectional 两种完整 pipeline workload、four-rack TP-cross
+   placement 上分别相对 general 改善 3 和 2，删除该特征后收益消失。
+
+因此“至少一个 LLM 特征在两种 workload/placement 上相对 general WAIT rollout 有独立收益”的
+R5 退出条件已经满足。但结论严格限定为高冲突结构 probe：two-rack 两个场景均为 0，真实 AICB
+尚未闭环，运行时也远大于收益。当前推荐是把 `chunk_wavefront` 和 `deferred_gap_fill` 保留为 R6
+候选生成器；其他 backbone/optimizer/dimension 特征保留 sidecar 接口，但在出现独立消融收益前不
+进入在线默认策略。
+
+正式输出为 `outputs/nonpreemptive_llm_structured/r5_summary.json`。
+
+R0--R5 联合定向回归为 `45 passed`，R5 专项为 `6 passed`。完整 `pytest tests -q` 为
+`890 passed, 3 skipped, 18 errors`；18 个 error 仍全部来自缺失的仓库外
+`Spectrum-X_8g_8gps_400Gbps_H100` topology fixture，与 R5 无关。
