@@ -1,6 +1,6 @@
 """Stage-0 semantic audit and structural metrics for training pipeline DAGs.
 
-Unlike ``export_pipeline_dags.py``, this tool materializes the *effective* DAG:
+Unlike ``pipeline_dag_export.py``, this tool materializes the *effective* DAG:
 the workload data-dependency edges plus the per-device compute serialization
 edges imposed by ``ExecutionPlan.compute_order``.  It validates that graph,
 computes structure metrics, and optionally compares it task-by-task with an
@@ -20,10 +20,14 @@ from pathlib import Path
 import sys
 from typing import Iterable
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
-from scripts.export_pipeline_dags import MODES, MODE_LABEL, stage_by_node
+from DAG_heuristic.single_channel.complex_chain.pipeline_dag_export import (
+    MODES,
+    MODE_LABEL,
+    stage_by_node,
+)
 from src.executor.analytical import AnalyticalExecutor
 from src.executor.policies.default_policy import DefaultSchedulingPolicy
 from src.static_analysis.passes.pipeline_task_serializers import (
@@ -768,7 +772,7 @@ def main() -> None:
     parser.add_argument("--dp-comm", type=int, default=2_097_152)
     parser.add_argument("--gradient-sync", type=int, default=2_097_152)
     parser.add_argument("--bandwidth-gbps", type=float, default=200.0)
-    parser.add_argument("--out", default="outputs/dag_audit")
+    parser.add_argument("--out", default="DAG_heuristic/outputs/dag_audit")
     parser.add_argument(
         "--timeline-mode",
         choices=list(MODES),

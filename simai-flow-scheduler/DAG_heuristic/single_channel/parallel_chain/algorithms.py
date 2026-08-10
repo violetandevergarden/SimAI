@@ -4,8 +4,7 @@ Every action completes one whole communication or waits to the next compute
 completion.  The compact chain state is cross-checked against the R0 DAG state
 machine and the R1 exact oracle on small instances.
 
-Example:
-    python scripts/study_nonpreemptive_parallel_chains.py --samples 100
+Use the public runner documented in ``DAG_heuristic/README.md``.
 """
 
 from __future__ import annotations

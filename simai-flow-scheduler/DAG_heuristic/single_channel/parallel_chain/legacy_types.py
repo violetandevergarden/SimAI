@@ -1,13 +1,7 @@
-"""Compare communication-priority heuristics on small parallel-chain DAGs.
+"""Parallel-chain instance types and historical comparison utilities.
 
-The model is the single-bottleneck special case from ``docs/260804组会.md``:
-each chain alternates an integer-sized communication operation and an
-independent compute delay.  Communication is preemptible at unit boundaries;
-all compute delays progress in parallel.  Dynamic programming gives the exact
-optimum for small instances and is intended only as a research oracle.
-
-Example:
-    python scripts/evaluate_chain_heuristics.py --samples 2000 --seed 260804
+Only the data types are part of the current algorithm path.  Scheduling uses
+the non-preemptive implementation in ``algorithms.py``.
 """
 
 from __future__ import annotations

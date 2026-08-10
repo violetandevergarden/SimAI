@@ -5,9 +5,9 @@ DP, binary-search feasibility DP, bounded beam search, one-step rollout, and a
 simple Monte-Carlo schedule sampler.  It also reports execution characteristics
 and restricted-case experiments.
 
-Example::
-
-    python scripts/study_parallel_chains.py --samples 200 --seed 260813
+The active non-preemptive algorithms import the instance generators and
+selected search helpers from this module.  Use the public scenario runner
+rather than this module's historical command-line entry point.
 """
 
 from __future__ import annotations

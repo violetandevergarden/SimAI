@@ -1,15 +1,8 @@
-"""Stage-4a study: topology conflicts for small communication DAGs.
+"""Multi-resource instance types and fixture generators.
 
-This is an intentionally small bridge between the single-channel oracle and
-the full analytical executor.  A communication occupies a set of unit-capacity
-logical resources (normally directed route links); ready communications whose
-sets are disjoint progress concurrently.  Durations are integral and flows are
-preemptible at quantum boundaries.  Compute semantics and dependency handling
-are identical to :mod:`scripts.benchmark_dag_oracle`.
-
-The model deliberately does *not* approximate bandwidth sharing.  Its purpose
-is to expose route-overlap decisions and to provide an exact oracle for small
-windows before a heuristic is integrated into the production executor.
+The registered algorithms use whole, non-preemptive flows.  Each flow occupies
+its complete fixed resource set until completion; this module does not model
+bandwidth sharing or route selection.
 """
 
 from __future__ import annotations

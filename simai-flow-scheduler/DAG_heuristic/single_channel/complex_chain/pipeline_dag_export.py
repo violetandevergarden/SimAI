@@ -1,7 +1,7 @@
 """Export the workload DAG produced by each PP pipeline strategy.
 
 This is a research/diagnostic tool for the DAG-scheduling heuristics line of
-work (see docs/260804组会.md).  For every PP pipeline strategy implemented in
+work (see ``DAG_heuristic/docs/260804组会.md``).  For every PP pipeline strategy implemented in
 the simulator it materializes the task DAG — compute nodes (duration_us) and
 flow nodes (src/dst/size_bytes) with dependency edges — and writes a compact
 ``dag.json``, a graphviz ``dag.dot``, a human-readable ``chain_view.txt``, and
@@ -12,11 +12,8 @@ the DAG is pure PP (no TP/DP collectives), which is the shape the research is
 interested in.  Pass ``--aicb`` to export from a real AICB file instead.
 
 Usage:
-    python scripts/export_pipeline_dags.py
-    python scripts/export_pipeline_dags.py --modes 1f1b zero_bubble
-    python scripts/export_pipeline_dags.py --pp 2 --ga 4 --layers 4 --pp-comm 2048
-    python scripts/export_pipeline_dags.py --aicb <path> --pp 4 --ga 8
-    python scripts/export_pipeline_dags.py --out outputs/dag_export --report docs/heuristic进度.md
+    python -m DAG_heuristic.single_channel.complex_chain.pipeline_dag_export
+    python -m DAG_heuristic.single_channel.complex_chain.pipeline_dag_export --modes 1f1b zero_bubble
 """
 
 from __future__ import annotations
@@ -27,7 +24,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from src.workload_format.schema import (
@@ -509,7 +506,7 @@ def write_report(
     header = "## DAG 导出记录（不同 PP 流水线方式的 DAG 结构）"
     text = [header, ""]
     text.append(
-        "- 生成：`python scripts/export_pipeline_dags.py`"
+        "- 生成：`python -m DAG_heuristic.single_channel.complex_chain.pipeline_dag_export`"
         "（默认合成小 workload；`--aicb <路径>` 可换成真实 AICB，"
         "`--pp/--ga/--layers/--pp-comm/--bandwidth-gbps` 可调参数，"
         "`--modes` 可选子集）"
@@ -628,8 +625,8 @@ def main() -> None:
                         help="Per-stage gradient sync bytes for Chimera/DualPipe.")
     parser.add_argument("--bandwidth-gbps", type=float, default=200.0,
                         help="Bottleneck capacity used for flow weights.")
-    parser.add_argument("--out", default="outputs/dag_export")
-    parser.add_argument("--report", default="docs/heuristic进度.md")
+    parser.add_argument("--out", default="DAG_heuristic/outputs/dag_export")
+    parser.add_argument("--report", default="DAG_heuristic/docs/heuristic进度.md")
     args = parser.parse_args()
 
     out_root = ROOT / args.out

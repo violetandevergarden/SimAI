@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from scripts.audit_pipeline_dags import (
+from DAG_heuristic.single_channel.complex_chain.pipeline_dag_audit import (
     analyze_effective_dag,
     build_hybrid_input,
     build_mode,
@@ -11,7 +11,7 @@ from scripts.audit_pipeline_dags import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 def _probe(*, tp: int = 1, dp: int = 1):
@@ -95,4 +95,3 @@ def test_executor_timeline_respects_effective_dag() -> None:
 
     assert result["validated"] is True
     assert result["effective_edge_violations"] == []
-

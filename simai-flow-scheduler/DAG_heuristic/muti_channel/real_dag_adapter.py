@@ -17,10 +17,11 @@ from statistics import mean
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+DAG_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from scripts.audit_pipeline_dags import (  # noqa: E402
+from DAG_heuristic.single_channel.complex_chain.pipeline_dag_audit import (  # noqa: E402
     analyze_effective_dag,
     build_hybrid_input,
     build_mode,
@@ -50,7 +51,7 @@ from src.workload_generator.aicb_parser import AicbParser  # noqa: E402
 
 
 DEFAULT_TOPOLOGY = (
-    ROOT / "inputs" / "topologies"
+    REPOSITORY_ROOT / "inputs" / "topologies"
     / "AlibabaHPN_16g_8gps_DualToR_DualPlane_200Gbps_A100"
 )
 
@@ -768,7 +769,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=ROOT / "outputs" / "llm_route_windows" / "report.json",
+        default=DAG_ROOT / "outputs" / "llm_route_windows" / "report.json",
     )
     args = parser.parse_args()
     report = run_study(

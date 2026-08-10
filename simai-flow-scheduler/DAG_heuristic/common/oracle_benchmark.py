@@ -1,9 +1,4 @@
-"""Run the revised R1 exact-oracle benchmark matrix.
-
-Example:
-    python scripts/study_nonpreemptive_oracle.py
-    python scripts/study_nonpreemptive_oracle.py --random-chains 20 --random-joins 10
-"""
+"""Run the non-preemptive exact-oracle benchmark matrix."""
 
 from __future__ import annotations
 

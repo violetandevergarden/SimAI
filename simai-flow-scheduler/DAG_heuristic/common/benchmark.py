@@ -1,20 +1,8 @@
-"""Reproducible small-DAG benchmarks and an exact scheduling oracle.
+"""Small-DAG data types, fixtures, lower bounds, and JSON conversion.
 
-Model
------
-* ``comm`` nodes share one unit-capacity, preemptive channel;
-* ``compute`` nodes start immediately when ready and progress in parallel;
-* all durations are positive integer quanta;
-* precedence edges already include fixed compute-resource order.
-
-This is deliberately the single-bottleneck research model used by the
-heuristic plan.  It is small-instance infrastructure, not a replacement for
-the topology-aware simulator.
-
-Examples::
-
-    python scripts/benchmark_dag_oracle.py
-    python scripts/benchmark_dag_oracle.py --search-samples 500
+Current non-preemptive scheduling uses :mod:`DAG_heuristic.common.model` and
+:mod:`DAG_heuristic.common.oracle`.  Historical benchmark helpers remain here
+only because fixture generators reuse them; they are not the public oracle.
 """
 
 from __future__ import annotations

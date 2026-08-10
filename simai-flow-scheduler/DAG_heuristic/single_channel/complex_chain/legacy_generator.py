@@ -1,10 +1,8 @@
-"""Stage-3 study: lift parallel-chain heuristics to small general DAGs.
+"""General-DAG fixtures and helper policies used by the migrated algorithms.
 
-The execution model is intentionally identical to ``benchmark_dag_oracle``:
-one preemptive communication bottleneck, immediately-started parallel compute,
-integer durations, and precedence edges that already include compute-resource
-serialization.  This module is research infrastructure, not a topology-aware
-executor policy.
+The public algorithms run with the non-preemptive state model.  Some historical
+comparison helpers remain in this module for fixture compatibility and are not
+registered as current algorithms.
 
 Implemented policies
 --------------------
@@ -13,9 +11,6 @@ Implemented policies
 * top-k event rollout with a gate-aware base policy;
 * bounded local event beam with an always-available gate-aware incumbent.
 
-Example::
-
-    python scripts/study_general_dag_heuristics.py --samples 100 --seed 260817
 """
 
 from __future__ import annotations
